@@ -2,79 +2,290 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
+  * @brief          : STM32F407 Discovery + PCA9685 (I2C3) — 3-DOF leg walking verify
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * Channel map (your wiring):
+  *   CH0 = Hip forward/back
+  *   CH1 = Knee
+  *   CH2 = Extension
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * Neutral angles (your measurements):
+  *   CH0 hip neutral  = 100 deg
+  *   CH1 knee neutral =   0 deg
+  *   CH2 ext neutral  =  55 deg
   *
+  * Notes:
+  * - This file assumes CubeMX generated I2C3 init (MX_I2C3_Init) exists in this same file.
+  * - If your PCA9685 address is not 0x40, change PCA9685_ADDR_7BIT.
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "usb_host.h"
 #include "pca9685.h"
-#include "bmi323.h"
+#include <stdio.h>
+#include <stdarg.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+// ===== PCA9685 I2C address (A0..A5 all low) =====
+#define PCA9685_ADDR_7BIT          0x40
+
+// ===== Channel mapping (per your note) =====
+#define SERVO_HIP_CH               0
+#define SERVO_KNEE_CH              2
+#define SERVO_EXT_CH               1
+
+// ===== Servo pulse ranges (safe starting defaults; tune per servo) =====
+// If your servos don’t reach full range or buzz, adjust these.
+#define HIP_MIN_US                 900.0f
+#define HIP_MAX_US                 2200.0f
+#define KNEE_MIN_US                900.0f
+#define KNEE_MAX_US                2200.0f
+#define EXT_MIN_US                 950.0f
+#define EXT_MAX_US                 2050.0f
+
+// ===== Neutral pose (your measured neutrals) =====
+#define HIP_NEUTRAL_DEG            100.0f
+#define KNEE_NEUTRAL_DEG             0.0f
+#define EXT_NEUTRAL_DEG             55.0f
+
+// ===== Invert directions if needed (0=no invert, 1=invert) =====
+#define INV_HIP                    0
+#define INV_KNEE                   0
+#define INV_EXT                    0
+
+// ===== Walking timing =====
+#define CONTROL_DT_MS              15U     // faster updates -> snappier motion
+#define STEP_PERIOD_MS             1100U   // slightly faster cycle
+#define START_HOLD_MS              1200U   // hold neutral before gait starts
+#define GAIT_RAMP_MS               1500U   // blend from neutral->gait to remove initial snap
+
+// ===== Gait amplitudes (start small!) =====
+#define HIP_SWING_AMPL_DEG         36.0f   // hip forward/back swing around neutral
+#define KNEE_BEND_AMPL_DEG         85.0f   // knee bend during swing (if knee neutral is 0, reduce!)
+#define EXT_LIFT_AMPL_DEG           0.0f   // extension during swing (set 0 to lock extension)
+
+// ===== Boot self-test =====
+#define SELFTEST_ON_BOOT           0
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+static float clampf(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static float smoothstep(float x)
+{
+  x = clampf(x, 0.0f, 1.0f);
+  return x * x * (3.0f - 2.0f * x);
+}
+
+static float apply_inv(float deg, int inv)
+{
+  if (!inv) return deg;
+  return 180.0f - deg;
+}
+
+static float map_angle_to_pulse_us(float angle_deg, float min_us, float max_us)
+{
+  angle_deg = clampf(angle_deg, 0.0f, 180.0f);
+  return min_us + (angle_deg / 180.0f) * (max_us - min_us);
+}
+
+static void set_servo_deg(PCA9685_Handle_t *hpca, uint8_t ch,
+                          float deg, float min_us, float max_us)
+{
+  float us = map_angle_to_pulse_us(deg, min_us, max_us);
+  (void)PCA9685_SetServoPulseUs(hpca, ch, us);
+}
+
+/*
+ * --- IMPORTANT FOR YOUR REQUEST ---
+ * "Hold CH1 exactly where it physically is" at startup == do NOT output PWM on CH1.
+ *
+ * We do this by putting that PCA9685 channel into "FULL OFF" mode (datasheet).
+ * The servo will stop receiving pulses and will NOT move to any commanded angle.
+ *
+ * Note: With no PWM signal, most hobby servos STOP actively holding torque and can
+ * drift if the leg is loaded. This is expected behavior.
+ */
+#define PCA9685_REG_LED0_ON_L   0x06U
+
+static HAL_StatusTypeDef PCA9685_SetChannelFullOff(PCA9685_Handle_t *hpca,
+                                                   uint8_t channel,
+                                                   uint8_t full_off)
+{
+  // LEDn regs: ON_L, ON_H, OFF_L, OFF_H
+  // FULL OFF bit is bit4 of OFF_H
+  uint8_t reg = (uint8_t)(PCA9685_REG_LED0_ON_L + 4U * channel);
+  uint8_t buf[4];
+
+  // We don't care about phase, so write zeros and set/clear full off bit.
+  buf[0] = 0x00;                // ON_L
+  buf[1] = 0x00;                // ON_H
+  buf[2] = 0x00;                // OFF_L
+  buf[3] = full_off ? 0x10 : 0x00; // OFF_H (bit4 = FULL OFF)
+
+  return HAL_I2C_Mem_Write(hpca->hi2c, (uint16_t)(hpca->addr_7bit << 1), reg,
+                           I2C_MEMADD_SIZE_8BIT, buf, sizeof(buf), 200);
+}
+
+static void Leg_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
+{
+  hip_deg  = apply_inv(hip_deg,  INV_HIP);
+  knee_deg = apply_inv(knee_deg, INV_KNEE);
+
+  set_servo_deg(hpca, SERVO_HIP_CH,  hip_deg,  HIP_MIN_US,  HIP_MAX_US);
+  set_servo_deg(hpca, SERVO_KNEE_CH, knee_deg, KNEE_MIN_US, KNEE_MAX_US);
+}
+
+// Only use this when you WANT extension to be actively driven.
+static void Leg_SetPoseAll(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg, float ext_deg)
+{
+  hip_deg  = apply_inv(hip_deg,  INV_HIP);
+  knee_deg = apply_inv(knee_deg, INV_KNEE);
+  ext_deg  = apply_inv(ext_deg,  INV_EXT);
+
+  set_servo_deg(hpca, SERVO_HIP_CH,  hip_deg,  HIP_MIN_US,  HIP_MAX_US);
+  set_servo_deg(hpca, SERVO_KNEE_CH, knee_deg, KNEE_MIN_US, KNEE_MAX_US);
+  set_servo_deg(hpca, SERVO_EXT_CH,  ext_deg,  EXT_MIN_US,  EXT_MAX_US);
+}
+
+// Kick action (NOT CALLED).
+// Enables CH1 (extension), kicks out quickly, returns, then disables CH1 again.
+static void Kick_Function(PCA9685_Handle_t *hpca)
+{
+  const float hip0  = HIP_NEUTRAL_DEG;
+  const float knee0 = KNEE_NEUTRAL_DEG;
+  const float ext0  = EXT_NEUTRAL_DEG;
+
+  const float kick_out_deg = clampf(ext0 + 25.0f, 0.0f, 180.0f);
+  const uint32_t out_ms    = 160;
+  const uint32_t hold_ms   = 60;
+  const uint32_t back_ms   = 220;
+
+  // Enable CH1 output (stop FULL OFF)
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_EXT_CH, 0);
+
+  // Neutral then kick
+  Leg_SetPoseAll(hpca, hip0, knee0, ext0);
+  HAL_Delay(60);
+
+  Leg_SetPoseAll(hpca, hip0, knee0, kick_out_deg);
+  HAL_Delay(out_ms);
+
+  HAL_Delay(hold_ms);
+
+  Leg_SetPoseAll(hpca, hip0, knee0, ext0);
+  HAL_Delay(back_ms);
+
+  // Disable CH1 again so it "holds where it is" (no PWM)
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_EXT_CH, 1);
+}
+
+// Walking task: call repeatedly from main while(1).
+// Extension (CH1) is FULL OFF, so we never touch it here.
+static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
+{
+  static uint32_t t0 = 0;
+  if (t0 == 0)
+  {
+    // Start gait at a phase where hip command is ~neutral to avoid an initial 'backward snap'
+    const float start_phase = 0.30f; // = 0.5 * stance_end (stance_end=0.60)
+    uint32_t now = HAL_GetTick();
+    t0 = now - (uint32_t)(start_phase * (float)step_period_ms);
+  }
+
+  float phase = (float)((HAL_GetTick() - t0) % step_period_ms) / (float)step_period_ms;
+
+  const float stance_end = 0.60f;
+
+  float hip  = HIP_NEUTRAL_DEG;
+  float knee = KNEE_NEUTRAL_DEG;
+
+  if (phase < stance_end)
+  {
+    float u = smoothstep(phase / stance_end);
+    hip  = HIP_NEUTRAL_DEG - HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
+    knee = KNEE_NEUTRAL_DEG + 7.0f;
+  }
+  else
+  {
+    float u = (phase - stance_end) / (1.0f - stance_end);
+    float s = smoothstep(u);
+
+    hip = HIP_NEUTRAL_DEG + HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
+
+    float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
+    knee = KNEE_NEUTRAL_DEG + (KNEE_BEND_AMPL_DEG * lift);
+  }
+
+  // Blend-in ramp so the first step doesn't "snap" backward/forward
+  static uint32_t gait_start_tick = 0;
+  if (gait_start_tick == 0) gait_start_tick = HAL_GetTick();
+  float a = (float)(HAL_GetTick() - gait_start_tick) / (float)GAIT_RAMP_MS;
+  a = smoothstep(a);
+
+  hip  = HIP_NEUTRAL_DEG  + a * (hip  - HIP_NEUTRAL_DEG);
+  knee = KNEE_NEUTRAL_DEG + a * (knee - KNEE_NEUTRAL_DEG);
+
+  hip  = clampf(hip,  0.0f, 180.0f);
+  knee = clampf(knee, 0.0f, 180.0f);
+
+  Leg_SetHipKnee(hpca, hip, knee);
+}
+
+extern UART_HandleTypeDef huart2;
+
+static void UART_Sendf(const char *fmt, ...)
+{
+  char buf[128];
+  va_list ap;
+  va_start(ap, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (len <= 0) return;
+  if (len > (int)sizeof(buf)) len = (int)sizeof(buf);
+  (void)HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)len, 200);
+}
 
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
-I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c3;
-
-I2S_HandleTypeDef hi2s3;
-
-SPI_HandleTypeDef hspi1;
+UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-
+PCA9685_Handle_t pca;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_I2C1_Init(void);
-static void MX_I2S3_Init(void);
-static void MX_SPI1_Init(void);
 static void MX_I2C3_Init(void);
-void MX_USB_HOST_Process(void);
+static void MX_USART2_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static float map_angle_to_pulse_us(float angle_deg)
-{
-  if (angle_deg < 0) angle_deg = 0;
-  if (angle_deg > 180) angle_deg = 180;
-  return 500.0f + (angle_deg / 180.0f) * 2000.0f;  // 500..2500us
-}
 /* USER CODE END 0 */
 
 /**
@@ -83,76 +294,55 @@ static float map_angle_to_pulse_us(float angle_deg)
   */
 int main(void)
 {
-
-  /* USER CODE BEGIN 1 */
-
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_I2C1_Init();
-  MX_I2S3_Init();
-  MX_SPI1_Init();
-  MX_USB_HOST_Init();
+  MX_USART2_UART_Init();
   MX_I2C3_Init();
-  /* USER CODE BEGIN 2 */
-  BMI323_t imu;
 
-  if (BMI323_Init(&imu, &hspi1, GPIOA, GPIO_PIN_4) != HAL_OK)
+  // Make sure the PCA9685 ACKs (wiring/pullups/address)
+  if (HAL_I2C_IsDeviceReady(&hi2c3, (PCA9685_ADDR_7BIT << 1), 5, 200) != HAL_OK)
   {
-    while(1) {}
+    while (1) { } // stuck here = I2C issue
   }
 
-  // Optional: bias calibration while the cat is still (e.g., first 1 second)
-  BMI323_CalibrateBias(&imu, 100, 10);
-  // Reset XYZ to 0 at power-on
-  BMI323_ResetOdometry(&imu);
-
-  PCA9685_Handle_t pca;
-  if (PCA9685_Init(&pca, &hi2c3, 0x40, 50.0f) != HAL_OK)
+  // Init PCA9685 at 50 Hz (standard servo rate)
+  if (PCA9685_Init(&pca, &hi2c3, PCA9685_ADDR_7BIT, 50.0f) != HAL_OK)
   {
-      // error handling: blink LED or stay here
-      while(1) {}
+    while (1) { } // stuck here = PCA init failed
   }
 
-  // Move to neutral positions
-  PCA9685_SetServoPulseUs(&pca, 0, map_angle_to_pulse_us(90)); // hip up/down
-  PCA9685_SetServoPulseUs(&pca, 1, map_angle_to_pulse_us(90)); // hip open/close
-  PCA9685_SetServoPulseUs(&pca, 2, map_angle_to_pulse_us(90)); // knee
-  HAL_Delay(1000);
-  /* USER CODE END 2 */
+  // FULL OFF at startup: do NOT output PWM on any channel.
+// This prevents ANY servo movement at boot (servos stay wherever they physically are).
+(void)PCA9685_SetChannelFullOff(&pca, SERVO_HIP_CH,  1);
+(void)PCA9685_SetChannelFullOff(&pca, SERVO_KNEE_CH, 1);
+(void)PCA9685_SetChannelFullOff(&pca, SERVO_EXT_CH,  1);
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+UART_Sendf("BOOT: outputs disabled (FULL OFF). Servos should NOT move.\r\n");
+UART_Sendf("NEUTRAL_DEG H=%.1f K=%.1f E=%.1f\r\n", HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG, EXT_NEUTRAL_DEG);
+
+#if START_ON_UART2_COMMAND
+UART_Sendf("Send 'g' over UART2 to START walking (CH0+CH2 enabled; CH1 stays off).\r\n");
+uint8_t ch = 0;
+do {
+  (void)HAL_UART_Receive(&huart2, &ch, 1, HAL_MAX_DELAY);
+} while (ch != (uint8_t)'g' && ch != (uint8_t)'G');
+UART_Sendf("START.\r\n");
+#endif
+
+// Enable CH0 + CH2 outputs now
+(void)PCA9685_SetChannelFullOff(&pca, SERVO_HIP_CH,  0);
+(void)PCA9685_SetChannelFullOff(&pca, SERVO_KNEE_CH, 0);
+
+// Command your defined neutral for hip+knee (extension remains FULL OFF)
+Leg_SetHipKnee(&pca, HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG);
+HAL_Delay(START_HOLD_MS);
+
   while (1)
   {
-    /* USER CODE END WHILE */
-    MX_USB_HOST_Process();
-    BMI323_UpdateOdometry(&imu);
-
-    const float *p = BMI323_GetPositionM(&imu);
-    // p[0]=x meters, p[1]=y meters, p[2]=z meters
-
-    /* USER CODE BEGIN 3 */
+    Walking_Task(&pca, STEP_PERIOD_MS);
+    HAL_Delay(CONTROL_DT_MS);
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -164,14 +354,9 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -182,11 +367,9 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLQ = 7;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
-    Error_Handler();
+    while (1) { }
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -196,42 +379,29 @@ void SystemClock_Config(void)
 
   if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
   {
-    Error_Handler();
+    while (1) { }
   }
 }
 
 /**
-  * @brief I2C1 Initialization Function
+  * @brief USART2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_I2C1_Init(void)
+static void MX_USART2_UART_Init(void)
 {
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
-  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
   {
-    Error_Handler();
+    while (1) { }
   }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
 }
 
 /**
@@ -241,14 +411,6 @@ static void MX_I2C1_Init(void)
   */
 static void MX_I2C3_Init(void)
 {
-
-  /* USER CODE BEGIN I2C3_Init 0 */
-
-  /* USER CODE END I2C3_Init 0 */
-
-  /* USER CODE BEGIN I2C3_Init 1 */
-
-  /* USER CODE END I2C3_Init 1 */
   hi2c3.Instance = I2C3;
   hi2c3.Init.ClockSpeed = 100000;
   hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -260,84 +422,8 @@ static void MX_I2C3_Init(void)
   hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
   if (HAL_I2C_Init(&hi2c3) != HAL_OK)
   {
-    Error_Handler();
+    while (1) { }
   }
-  /* USER CODE BEGIN I2C3_Init 2 */
-
-  /* USER CODE END I2C3_Init 2 */
-
-}
-
-/**
-  * @brief I2S3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_I2S3_Init(void)
-{
-
-  /* USER CODE BEGIN I2S3_Init 0 */
-
-  /* USER CODE END I2S3_Init 0 */
-
-  /* USER CODE BEGIN I2S3_Init 1 */
-
-  /* USER CODE END I2S3_Init 1 */
-  hi2s3.Instance = SPI3;
-  hi2s3.Init.Mode = I2S_MODE_MASTER_TX;
-  hi2s3.Init.Standard = I2S_STANDARD_PHILIPS;
-  hi2s3.Init.DataFormat = I2S_DATAFORMAT_16B;
-  hi2s3.Init.MCLKOutput = I2S_MCLKOUTPUT_ENABLE;
-  hi2s3.Init.AudioFreq = I2S_AUDIOFREQ_96K;
-  hi2s3.Init.CPOL = I2S_CPOL_LOW;
-  hi2s3.Init.ClockSource = I2S_CLOCK_PLL;
-  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
-  if (HAL_I2S_Init(&hi2s3) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN I2S3_Init 2 */
-
-  /* USER CODE END I2S3_Init 2 */
-
-}
-
-/**
-  * @brief SPI1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_SPI1_Init(void)
-{
-
-  /* USER CODE BEGIN SPI1_Init 0 */
-
-  /* USER CODE END SPI1_Init 0 */
-
-  /* USER CODE BEGIN SPI1_Init 1 */
-
-  /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN SPI1_Init 2 */
-
-  /* USER CODE END SPI1_Init 2 */
-
 }
 
 /**
@@ -347,128 +433,12 @@ static void MX_SPI1_Init(void)
   */
 static void MX_GPIO_Init(void)
 {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : CS_I2C_SPI_Pin */
-  GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PDM_OUT_Pin */
-  GPIO_InitStruct.Pin = PDM_OUT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-  HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : BOOT1_Pin */
-  GPIO_InitStruct.Pin = BOOT1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : CLK_IN_Pin */
-  GPIO_InitStruct.Pin = CLK_IN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-  HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
-                           Audio_RST_Pin */
-  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : MEMS_INT2_Pin */
-  GPIO_InitStruct.Pin = MEMS_INT2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-
 /* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
-{
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
-}
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
