@@ -1,9 +1,4 @@
-// jetson_cmd.c
-// Build:  gcc -O2 -Wall jetson_cmd.c -o jetson_cmd
-// Run:    sudo ./jetson_cmd
-//
-// Type commands like: GO, FWD, BWD, STOP then press Enter.
-// It will send "<YOURTEXT>\n" to /dev/ttyTHS1 and print any STM32 replies.
+
 
 #include <errno.h>
 #include <fcntl.h>
