@@ -1,10 +1,3 @@
-// jetson_go.c
-// Build:  gcc -O2 -Wall jetson_go.c -o jetson_go
-// Run:    ./jetson_go
-//
-// Opens /dev/ttyTHS1 @115200 8N1, sends "GO\n", then prints any STM32 replies.
-// Press 's' + Enter to send STOP, 'g' + Enter to send GO again, 'q' to quit.
-
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -23,16 +16,14 @@ static int set_serial(int fd, int baud)
 
   cfmakeraw(&tty);
 
-  // 8N1
   tty.c_cflag &= ~PARENB;
   tty.c_cflag &= ~CSTOPB;
   tty.c_cflag &= ~CSIZE;
   tty.c_cflag |= CS8;
 
   tty.c_cflag |= (CLOCAL | CREAD);
-  tty.c_cflag &= ~CRTSCTS;      // no HW flow control
+  tty.c_cflag &= ~CRTSCTS;     
 
-  // Non-blocking reads with select()
   tty.c_cc[VMIN]  = 0;
   tty.c_cc[VTIME] = 0;
 
@@ -82,7 +73,6 @@ int main(void)
 
   printf("Opened %s @115200 8N1\n", dev);
 
-  // Send GO
   if (write_all(fd, "GO\n") != 0) {
     close(fd);
     return 1;
@@ -102,7 +92,7 @@ int main(void)
     int maxfd = (fd > STDIN_FILENO) ? fd : STDIN_FILENO;
     struct timeval tv;
     tv.tv_sec = 0;
-    tv.tv_usec = 200000; // 200ms
+    tv.tv_usec = 200000;
 
     int r = select(maxfd + 1, &rset, NULL, NULL, &tv);
     if (r < 0) {
@@ -115,7 +105,7 @@ int main(void)
       ssize_t n = read(fd, rxbuf, sizeof(rxbuf) - 1);
       if (n > 0) {
         rxbuf[n] = '\0';
-        printf("STM32: %s", rxbuf); // STM32 prints \r\n
+        printf("STM32: %s", rxbuf);
         fflush(stdout);
       }
     }
