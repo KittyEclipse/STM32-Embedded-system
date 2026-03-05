@@ -5,6 +5,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <time.h>
 
 static int set_serial(int fd, int baud)
 {
@@ -22,7 +23,7 @@ static int set_serial(int fd, int baud)
   tty.c_cflag |= CS8;
 
   tty.c_cflag |= (CLOCAL | CREAD);
-  tty.c_cflag &= ~CRTSCTS;     
+  tty.c_cflag &= ~CRTSCTS;
 
   tty.c_cc[VMIN]  = 0;
   tty.c_cc[VTIME] = 0;
@@ -57,6 +58,85 @@ static int write_all(int fd, const char *s)
   return 0;
 }
 
+static int send_line(int fd, const char *line_no_nl)
+{
+  char buf[128];
+  snprintf(buf, sizeof(buf), "%s\n", line_no_nl);
+  return write_all(fd, buf);
+}
+
+static long long now_ms(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
+}
+
+static int drain_uart_print_lines(int fd, const char *needle)
+{
+  static char acc[1024];
+  static size_t acc_len = 0;
+
+  char rxbuf[256];
+  int saw = 0;
+
+  for (;;) {
+    ssize_t n = read(fd, rxbuf, sizeof(rxbuf));
+    if (n <= 0) break;
+
+    for (ssize_t i = 0; i < n; i++) {
+      char c = rxbuf[i];
+      if (acc_len < sizeof(acc) - 1) {
+        acc[acc_len++] = c;
+      }
+
+      if (c == '\n' || c == '\r') {
+        while (acc_len && (acc[acc_len - 1] == '\n' || acc[acc_len - 1] == '\r')) acc_len--;
+        acc[acc_len] = '\0';
+
+        if (acc_len) {
+          printf("STM32: %s\n", acc);
+          fflush(stdout);
+          if (needle && needle[0] && strstr(acc, needle)) {
+            saw = 1;
+          }
+        }
+
+        acc_len = 0;
+      }
+    }
+  }
+
+  return saw;
+}
+
+static int wait_for_token(int fd, const char *needle, int timeout_ms)
+{
+  long long t_end = now_ms() + (long long)timeout_ms;
+
+  while (now_ms() < t_end) {
+    fd_set rset;
+    FD_ZERO(&rset);
+    FD_SET(fd, &rset);
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 200000; 
+
+    int r = select(fd + 1, &rset, NULL, NULL, &tv);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      perror("select");
+      return 0;
+    }
+
+    if (FD_ISSET(fd, &rset)) {
+      if (drain_uart_print_lines(fd, needle)) return 1;
+    }
+  }
+  return 0;
+}
+
 int main(void)
 {
   const char *dev = "/dev/ttyTHS1";
@@ -72,15 +152,13 @@ int main(void)
   }
 
   printf("Opened %s @115200 8N1\n", dev);
+  printf("Commands:\n");
+  printf("  g = GO (waits for STM32 confirm)\n");
+  printf("  s = STOP (leg should return neutral)\n");
+  printf("  f = FWD (switch direction while running)\n");
+  printf("  b = BACK (switch direction while running)\n");
+  printf("  q = quit\n\n");
 
-  if (write_all(fd, "GO\n") != 0) {
-    close(fd);
-    return 1;
-  }
-  printf("Sent: GO\\n\n");
-  printf("Commands: g=GO, s=STOP, q=quit (press key then Enter)\n\n");
-
-  char rxbuf[256];
   char inbuf[64];
 
   while (1) {
@@ -90,6 +168,7 @@ int main(void)
     FD_SET(STDIN_FILENO, &rset);
 
     int maxfd = (fd > STDIN_FILENO) ? fd : STDIN_FILENO;
+
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 200000;
@@ -102,25 +181,35 @@ int main(void)
     }
 
     if (FD_ISSET(fd, &rset)) {
-      ssize_t n = read(fd, rxbuf, sizeof(rxbuf) - 1);
-      if (n > 0) {
-        rxbuf[n] = '\0';
-        printf("STM32: %s", rxbuf);
-        fflush(stdout);
-      }
+      (void)drain_uart_print_lines(fd, NULL);
     }
 
     if (FD_ISSET(STDIN_FILENO, &rset)) {
       if (!fgets(inbuf, sizeof(inbuf), stdin)) break;
+
       if (inbuf[0] == 'q') break;
+
       if (inbuf[0] == 'g') {
-        write_all(fd, "GO\n");
-        printf("Sent: GO\\n\n");
+
+        if (send_line(fd, "GO") != 0) break;
+        printf("Sent: GO\\n (waiting for confirm...)\n");
+
+        if (wait_for_token(fd, "GO RECEIVED", 3000)) {
+          printf("Confirm: STM32 accepted GO\n\n");
+        } else {
+          printf("No confirm received within 3s. Check wiring/baud or STM32 prints.\n\n");
+        }
       } else if (inbuf[0] == 's') {
-        write_all(fd, "STOP\n");
-        printf("Sent: STOP\\n\n");
+        if (send_line(fd, "STOP") != 0) break;
+        printf("Sent: STOP\\n (STM32 should return neutral + disable)\n\n");
+      } else if (inbuf[0] == 'f') {
+        if (send_line(fd, "FWD") != 0) break;
+        printf("Sent: FWD\\n\n\n");
+      } else if (inbuf[0] == 'b') {
+        if (send_line(fd, "BACK") != 0) break;
+        printf("Sent: BACK\\n\n\n");
       } else {
-        printf("Unknown. Use g/s/q.\n");
+        printf("Unknown. Use g/s/f/b/q.\n\n");
       }
     }
   }
