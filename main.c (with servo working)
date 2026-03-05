@@ -1,0 +1,484 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : STM32F407 + PCA9685 (I2C3) leg walk, gated by UART2 confirm from Jetson
+  *
+  * UART2 protocol (ASCII lines):
+  *   - STM32 prints: "STM32 READY. Send GO"
+  *   - Jetson sends: "GO\n"  -> STM32 starts walking
+  *   - Jetson sends: "STOP\n" -> STM32 disables outputs and waits for GO again
+  *
+  * PCA9685 channel map (your wiring):
+  *   CH0 = Hip forward/back
+  *   CH2 = Knee
+  *   CH1 = Extension (kept FULL OFF in this file unless you enable it)
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "pca9685.h"
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
+
+/* Private define ------------------------------------------------------------*/
+
+// ===== PCA9685 I2C address (A0..A5 all low) =====
+#define PCA9685_ADDR_7BIT          0x40
+
+// ===== Channel mapping =====
+#define SERVO_HIP_CH               0
+#define SERVO_KNEE_CH              2
+#define SERVO_EXT_CH               1
+
+// ===== Servo pulse ranges (tune per servo) =====
+#define HIP_MIN_US                 900.0f
+#define HIP_MAX_US                 2200.0f
+#define KNEE_MIN_US                900.0f
+#define KNEE_MAX_US                2200.0f
+#define EXT_MIN_US                 950.0f
+#define EXT_MAX_US                 2050.0f
+
+// ===== Neutral pose =====
+#define HIP_NEUTRAL_DEG            100.0f
+#define KNEE_NEUTRAL_DEG             0.0f
+#define EXT_NEUTRAL_DEG             55.0f
+
+// ===== Invert directions if needed (0=no invert, 1=invert) =====
+#define INV_HIP                    0
+#define INV_KNEE                   0
+#define INV_EXT                    0
+
+// ===== Walking timing =====
+#define CONTROL_DT_MS              15U
+#define STEP_PERIOD_MS             1100U
+#define START_HOLD_MS              1200U
+#define GAIT_RAMP_MS               1500U
+
+// ===== Gait amplitudes =====
+#define HIP_SWING_AMPL_DEG         36.0f
+#define KNEE_BEND_AMPL_DEG         85.0f
+#define EXT_LIFT_AMPL_DEG           0.0f
+
+// ===== UART tokens =====
+#define TOKEN_GO                   "GO"
+#define TOKEN_STOP                 "STOP"
+
+// ===== UART receive timeouts =====
+#define UART_BYTE_TIMEOUT_MS       10U
+#define UART_LINE_MAX              32
+
+// ===== Touch sensor (PE8) =====
+#define TOUCH_GPIO_PORT            GPIOE
+#define TOUCH_GPIO_PIN             GPIO_PIN_8
+#define TOUCH_DEBOUNCE_MS          35U
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c3;
+UART_HandleTypeDef huart2;
+
+PCA9685_Handle_t pca;
+
+static uint8_t walk_enabled = 0;
+static uint8_t touch_stable = 0;
+static uint8_t touch_last_raw = 0;
+static uint32_t touch_last_change_ms = 0;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C3_Init(void);
+static void MX_USART2_UART_Init(void);
+
+/* Helpers ------------------------------------------------------------------*/
+static float clampf(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static float smoothstep(float x)
+{
+  x = clampf(x, 0.0f, 1.0f);
+  return x * x * (3.0f - 2.0f * x);
+}
+
+static float apply_inv(float deg, int inv)
+{
+  if (!inv) return deg;
+  return 180.0f - deg;
+}
+
+static float map_angle_to_pulse_us(float angle_deg, float min_us, float max_us)
+{
+  angle_deg = clampf(angle_deg, 0.0f, 180.0f);
+  return min_us + (angle_deg / 180.0f) * (max_us - min_us);
+}
+
+static void set_servo_deg(PCA9685_Handle_t *hpca, uint8_t ch,
+                          float deg, float min_us, float max_us)
+{
+  float us = map_angle_to_pulse_us(deg, min_us, max_us);
+  (void)PCA9685_SetServoPulseUs(hpca, ch, us);
+}
+
+static void Leg_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
+{
+  hip_deg  = apply_inv(hip_deg,  INV_HIP);
+  knee_deg = apply_inv(knee_deg, INV_KNEE);
+
+  set_servo_deg(hpca, SERVO_HIP_CH,  hip_deg,  HIP_MIN_US,  HIP_MAX_US);
+  set_servo_deg(hpca, SERVO_KNEE_CH, knee_deg, KNEE_MIN_US, KNEE_MAX_US);
+}
+
+// Optional (not used in gait here)
+static void Leg_SetPoseAll(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg, float ext_deg)
+{
+  hip_deg  = apply_inv(hip_deg,  INV_HIP);
+  knee_deg = apply_inv(knee_deg, INV_KNEE);
+  ext_deg  = apply_inv(ext_deg,  INV_EXT);
+
+  set_servo_deg(hpca, SERVO_HIP_CH,  hip_deg,  HIP_MIN_US,  HIP_MAX_US);
+  set_servo_deg(hpca, SERVO_KNEE_CH, knee_deg, KNEE_MIN_US, KNEE_MAX_US);
+  set_servo_deg(hpca, SERVO_EXT_CH,  ext_deg,  EXT_MIN_US,  EXT_MAX_US);
+}
+
+static void UART_Sendf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (len <= 0) return;
+  if (len > (int)sizeof(buf)) len = (int)sizeof(buf);
+  (void)HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)len, 200);
+}
+
+// Read one ASCII line (ending with \n). Non-blocking-ish: polls bytes with small timeout.
+// Returns 1 when a full line is captured into out (null-terminated). Returns 0 otherwise.
+static int UART_TryReadLine(char out[UART_LINE_MAX])
+{
+  static char line[UART_LINE_MAX];
+  static uint8_t idx = 0;
+
+  uint8_t b = 0;
+  if (HAL_UART_Receive(&huart2, &b, 1, UART_BYTE_TIMEOUT_MS) != HAL_OK)
+    return 0;
+
+  if (b == '\r')
+    return 0;
+
+  if (b == '\n')
+  {
+    line[idx] = '\0';
+    strncpy(out, line, UART_LINE_MAX);
+    out[UART_LINE_MAX - 1] = '\0';
+    idx = 0;
+    return 1;
+  }
+
+  if (idx < (UART_LINE_MAX - 1))
+    line[idx++] = (char)b;
+  else
+    idx = 0; // overflow -> reset
+
+  return 0;
+}
+
+static void str_to_upper(char *s)
+{
+  while (*s) { *s = (char)toupper((unsigned char)*s); s++; }
+}
+
+// Returns 1 if started (GO received). Can also catch STOP and keep waiting.
+static int UART_WaitForGO_WhileSafeDisabled(void)
+{
+  UART_Sendf("STM32 READY. Send %s\\n to start. Send %s\\n to stop.\\r\\n", TOKEN_GO, TOKEN_STOP);
+
+  char rx[UART_LINE_MAX];
+
+  while (1)
+  {
+    if (UART_TryReadLine(rx))
+    {
+      str_to_upper(rx);
+
+      if (strcmp(rx, TOKEN_GO) == 0)
+      {
+        UART_Sendf("CONFIRMED. STARTING WALK.\\r\\n");
+        return 1;
+      }
+      if (strcmp(rx, TOKEN_STOP) == 0)
+      {
+        UART_Sendf("STOP ACK. Outputs remain disabled.\\r\\n");
+        // already disabled, keep waiting
+      }
+      else
+      {
+        UART_Sendf("UNKNOWN: '%s' (send %s)\\r\\n", rx, TOKEN_GO);
+      }
+    }
+  }
+}
+
+// Walking task: call repeatedly from main while(1).
+// Extension (CH1) stays FULL OFF unless you enable it.
+static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
+{
+  static uint32_t t0 = 0;
+  if (t0 == 0)
+  {
+    const float start_phase = 0.30f;
+    uint32_t now = HAL_GetTick();
+    t0 = now - (uint32_t)(start_phase * (float)step_period_ms);
+  }
+
+  float phase = (float)((HAL_GetTick() - t0) % step_period_ms) / (float)step_period_ms;
+
+  const float stance_end = 0.60f;
+
+  float hip  = HIP_NEUTRAL_DEG;
+  float knee = KNEE_NEUTRAL_DEG;
+
+  if (phase < stance_end)
+  {
+    float u = smoothstep(phase / stance_end);
+    hip  = HIP_NEUTRAL_DEG - HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
+    knee = KNEE_NEUTRAL_DEG + 7.0f;
+  }
+  else
+  {
+    float u = (phase - stance_end) / (1.0f - stance_end);
+    float s = smoothstep(u);
+
+    hip = HIP_NEUTRAL_DEG + HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
+
+    float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
+    knee = KNEE_NEUTRAL_DEG + (KNEE_BEND_AMPL_DEG * lift);
+  }
+
+  static uint32_t gait_start_tick = 0;
+  if (gait_start_tick == 0) gait_start_tick = HAL_GetTick();
+  float a = (float)(HAL_GetTick() - gait_start_tick) / (float)GAIT_RAMP_MS;
+  a = smoothstep(a);
+
+  hip  = HIP_NEUTRAL_DEG  + a * (hip  - HIP_NEUTRAL_DEG);
+  knee = KNEE_NEUTRAL_DEG + a * (knee - KNEE_NEUTRAL_DEG);
+
+  hip  = clampf(hip,  0.0f, 180.0f);
+  knee = clampf(knee, 0.0f, 180.0f);
+
+  Leg_SetHipKnee(hpca, hip, knee);
+}
+
+// Disable all PWM outputs (FULL OFF)
+static void PCA_AllOff(PCA9685_Handle_t *hpca)
+{
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_KNEE_CH, 1);
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_EXT_CH,  1);
+}
+
+// Enable hip+knee, keep extension OFF
+static void PCA_EnableHipKnee(PCA9685_Handle_t *hpca)
+{
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_HIP_CH,  0);
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(hpca, SERVO_EXT_CH,  1);
+}
+
+// Simple debounced touch toggle:
+//  - Rising edge: toggles walk_enabled and updates servo outputs
+static void Touch_Task(void)
+{
+  uint32_t now = HAL_GetTick();
+  uint8_t raw = (HAL_GPIO_ReadPin(TOUCH_GPIO_PORT, TOUCH_GPIO_PIN) == GPIO_PIN_SET) ? 1U : 0U;
+
+  if (raw != touch_last_raw) {
+    touch_last_raw = raw;
+    touch_last_change_ms = now;
+  }
+
+  if ((uint32_t)(now - touch_last_change_ms) >= TOUCH_DEBOUNCE_MS) {
+    if (touch_stable != touch_last_raw) {
+      touch_stable = touch_last_raw;
+      if (touch_stable) {
+        // Rising edge -> toggle walking state
+        walk_enabled = walk_enabled ? 0 : 1;
+
+        if (walk_enabled) {
+          UART_Sendf("TOUCH: START WALK\r\n");
+          PCA_EnableHipKnee(&pca);
+          Leg_SetHipKnee(&pca, HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG);
+          HAL_Delay(START_HOLD_MS);
+        } else {
+          UART_Sendf("TOUCH: STOP WALK\r\n");
+          PCA_AllOff(&pca);
+        }
+      }
+    }
+  }
+}
+
+/* Main ---------------------------------------------------------------------*/
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_I2C3_Init();
+
+  UART_Sendf("\\r\\nBOOT... UART2 OK @115200\\r\\n");
+
+  // Check PCA9685 is present
+  if (HAL_I2C_IsDeviceReady(&hi2c3, (PCA9685_ADDR_7BIT << 1), 5, 200) != HAL_OK)
+  {
+    UART_Sendf("ERROR: PCA9685 not responding on I2C3 addr 0x%02X\\r\\n", PCA9685_ADDR_7BIT);
+    while (1) { }
+  }
+
+  if (PCA9685_Init(&pca, &hi2c3, PCA9685_ADDR_7BIT, 50.0f) != HAL_OK)
+  {
+    UART_Sendf("ERROR: PCA9685_Init failed\\r\\n");
+    while (1) { }
+  }
+
+  // Safety: disable outputs so NOTHING moves until enabled
+  PCA_AllOff(&pca);
+  UART_Sendf("Outputs DISABLED (FULL OFF). Servos should NOT move.\\r\\n");
+  UART_Sendf("Neutral: H=%.1f K=%.1f E=%.1f\\r\\n", HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG, EXT_NEUTRAL_DEG);
+  UART_Sendf("Control: Send %s/%s over UART or tap touch sensor to toggle walk.\\r\\n",
+             TOKEN_GO, TOKEN_STOP);
+
+  // Initialize touch debounce state
+  touch_last_raw = (HAL_GPIO_ReadPin(TOUCH_GPIO_PORT, TOUCH_GPIO_PIN) == GPIO_PIN_SET) ? 1U : 0U;
+  touch_stable = touch_last_raw;
+  touch_last_change_ms = HAL_GetTick();
+
+  char rx[UART_LINE_MAX];
+
+  while (1)
+  {
+    // Handle UART control (GO/STOP) from Jetson
+    if (UART_TryReadLine(rx))
+    {
+      str_to_upper(rx);
+      if (strcmp(rx, TOKEN_GO) == 0) {
+        if (!walk_enabled) {
+          UART_Sendf("GO RECEIVED. Enabling walk.\\r\\n");
+          walk_enabled = 1;
+          PCA_EnableHipKnee(&pca);
+          Leg_SetHipKnee(&pca, HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG);
+          HAL_Delay(START_HOLD_MS);
+        } else {
+          UART_Sendf("GO IGNORED, already walking.\\r\\n");
+        }
+      } else if (strcmp(rx, TOKEN_STOP) == 0) {
+        if (walk_enabled) {
+          UART_Sendf("STOP RECEIVED. Disabling outputs.\\r\\n");
+          walk_enabled = 0;
+          PCA_AllOff(&pca);
+        } else {
+          UART_Sendf("STOP IGNORED, already stopped.\\r\\n");
+        }
+      } else {
+        UART_Sendf("UNKNOWN: '%s' (send %s/%s)\\r\\n", rx, TOKEN_GO, TOKEN_STOP);
+      }
+    }
+
+    // Handle local touch sensor toggle
+    Touch_Task();
+
+    // Only walk when enabled by either Jetson or touch
+    if (walk_enabled) {
+      Walking_Task(&pca, STEP_PERIOD_MS);
+    }
+
+    HAL_Delay(CONTROL_DT_MS);
+  }
+}
+
+/* Clock / Peripherals ------------------------------------------------------*/
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { while (1) { } }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) { while (1) { } }
+}
+
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK) { while (1) { } }
+}
+
+static void MX_I2C3_Init(void)
+{
+  hi2c3.Instance = I2C3;
+  hi2c3.Init.ClockSpeed = 100000;
+  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1 = 0;
+  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK) { while (1) { } }
+}
+
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
+
+  // Touch sensor input (PE8) with pull-down
+  GPIO_InitStruct.Pin = TOUCH_GPIO_PIN;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(TOUCH_GPIO_PORT, &GPIO_InitStruct);
+}
+
+/* USER CODE END */
