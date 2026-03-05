@@ -1,5 +1,3 @@
-
-
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -53,7 +51,17 @@ int main(void)
   if (set_serial(fd) != 0) { close(fd); return 1; }
 
   printf("Opened %s @115200 8N1\n", dev);
-  printf("Type command then Enter (GO/FWD/BWD/STOP). Type QUIT to exit.\n\n");
+  printf("Waiting for STM32... (handshake PING/PONG)\n");
+
+  // --- Handshake ---
+  // STM32 will print PING? until we send PING. We'll send PING a few times.
+  for (int i = 0; i < 5; i++) {
+    const char *ping = "PING\n";
+    (void)write_all(fd, ping, strlen(ping));
+    usleep(150 * 1000);
+  }
+
+  printf("Type command then Enter (GO/FWD/BWD/STOP/NEUTRAL/OFF/TEST). Type QUIT to exit.\n\n");
 
   char rx[256];
   char line[128];
@@ -89,6 +97,22 @@ int main(void)
       snprintf(out, sizeof(out), "%s\n", line);
       if (write_all(fd, out, strlen(out)) != 0) break;
       printf("Sent: %s\\n\n", line);
+
+      // Optional: wait briefly for ACK so you know STM32 accepted the command
+      // (non-blocking, short timeout)
+      for (int tries = 0; tries < 5; tries++) {
+        fd_set a;
+        FD_ZERO(&a);
+        FD_SET(fd, &a);
+        struct timeval tv2 = { .tv_sec = 0, .tv_usec = 120000 };
+        int rr = select(fd + 1, &a, NULL, NULL, &tv2);
+        if (rr > 0 && FD_ISSET(fd, &a)) {
+          ssize_t n = read(fd, rx, sizeof(rx) - 1);
+          if (n > 0) { rx[n] = 0; printf("STM32: %s", rx); fflush(stdout); }
+        } else {
+          break;
+        }
+      }
     }
   }
 
