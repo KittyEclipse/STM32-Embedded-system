@@ -1,0 +1,521 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : STM32F407 + PCA9685 (I2C3) leg walk, gated by UART2 confirm from Jetson
+  *
+  * UART2 protocol (ASCII lines):
+  *   - STM32 prints: "STM32 READY. Send GO"
+  *   - Jetson sends: "GO\n"  -> STM32 starts walking
+  *   - Jetson sends: "STOP\n" -> STM32 disables outputs and waits for GO again
+  *
+  * PCA9685 channel map (your wiring):
+  *   Front Right: CH0 hip, CH2 knee, CH1 extension
+  *   Front Left:  CH3 hip, CH5 knee, CH4 extension
+  *   Back Right:  CH6 hip, CH7 knee
+  *   Back Left:   CH8 hip, CH9 knee (kept FULL OFF in this file unless you enable it)
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "pca9685.h"
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
+
+/* Private define ------------------------------------------------------------*/
+
+// ===== PCA9685 I2C address (A0..A5 all low) =====
+#define PCA9685_ADDR_7BIT          0x40
+
+// ===== PCA9685 channel mapping (your wiring) =====
+// Front Right (existing leg)
+#define FR_HIP_CH                 0
+#define FR_KNEE_CH                2
+#define FR_EXT_CH                 1
+
+// Front Left (identical to front right)
+#define FL_HIP_CH                 3
+#define FL_KNEE_CH                5
+#define FL_EXT_CH                 4
+
+// Back Right (hip + knee only)
+#define BR_HIP_CH                 6
+#define BR_KNEE_CH                7
+
+// Back Left (hip + knee only)
+#define BL_HIP_CH                 8
+#define BL_KNEE_CH                9
+
+// ===== Servo pulse ranges (tune per servo) =====
+#define HIP_MIN_US                 900.0f
+#define HIP_MAX_US                 2200.0f
+#define KNEE_MIN_US                900.0f
+#define KNEE_MAX_US                2200.0f
+#define EXT_MIN_US                 950.0f
+#define EXT_MAX_US                 2050.0f
+
+// ===== Neutral pose (degrees) =====
+// Front legs
+#define FR_HIP_NEUTRAL_DEG        100.0f
+#define FR_KNEE_NEUTRAL_DEG         0.0f
+#define FR_EXT_NEUTRAL_DEG         55.0f
+
+#define FL_HIP_NEUTRAL_DEG        100.0f
+#define FL_KNEE_NEUTRAL_DEG         0.0f
+#define FL_EXT_NEUTRAL_DEG         55.0f
+
+// Back legs (hip+knee only) — start with same neutrals, tweak later if needed
+#define BR_HIP_NEUTRAL_DEG        100.0f
+#define BR_KNEE_NEUTRAL_DEG         0.0f
+
+#define BL_HIP_NEUTRAL_DEG        100.0f
+#define BL_KNEE_NEUTRAL_DEG         0.0f
+
+// ===== Invert directions if needed (0=no invert, 1=invert) =====
+#define INV_HIP                    0
+#define INV_KNEE                   0
+#define INV_EXT                    0
+
+// ===== Walking timing =====
+#define CONTROL_DT_MS              15U
+#define STEP_PERIOD_MS             1100U
+#define START_HOLD_MS              1200U
+#define GAIT_RAMP_MS               1500U
+
+// ===== Gait amplitudes =====
+#define HIP_SWING_AMPL_DEG         36.0f
+#define KNEE_BEND_AMPL_DEG         85.0f
+#define EXT_LIFT_AMPL_DEG           0.0f
+
+// ===== UART tokens =====
+#define TOKEN_GO                   "GO"
+#define TOKEN_STOP                 "STOP"
+#define TOKEN_FWD                  "FWD"
+#define TOKEN_BACK                 "BACK"
+
+// ===== UART receive timeouts =====
+#define UART_BYTE_TIMEOUT_MS       10U
+#define UART_LINE_MAX              32
+
+/* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c3;
+UART_HandleTypeDef huart2;
+
+PCA9685_Handle_t pca;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C3_Init(void);
+static void MX_USART2_UART_Init(void);
+
+/* Helpers ------------------------------------------------------------------*/
+static float clampf(float v, float lo, float hi)
+{
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+static float smoothstep(float x)
+{
+  x = clampf(x, 0.0f, 1.0f);
+  return x * x * (3.0f - 2.0f * x);
+}
+
+static float apply_inv(float deg, int inv)
+{
+  if (!inv) return deg;
+  return 180.0f - deg;
+}
+
+static float map_angle_to_pulse_us(float angle_deg, float min_us, float max_us)
+{
+  angle_deg = clampf(angle_deg, 0.0f, 180.0f);
+  return min_us + (angle_deg / 180.0f) * (max_us - min_us);
+}
+
+static void set_servo_deg(PCA9685_Handle_t *hpca, uint8_t ch,
+                          float deg, float min_us, float max_us)
+{
+  float us = map_angle_to_pulse_us(deg, min_us, max_us);
+  (void)PCA9685_SetServoPulseUs(hpca, ch, us);
+}
+
+static void Leg_SetHipKnee_Ch(PCA9685_Handle_t *hpca,
+                              uint8_t hip_ch, uint8_t knee_ch,
+                              float hip_deg, float knee_deg)
+{
+  hip_deg  = apply_inv(hip_deg,  INV_HIP);
+  knee_deg = apply_inv(knee_deg, INV_KNEE);
+
+  set_servo_deg(hpca, hip_ch,  hip_deg,  HIP_MIN_US,  HIP_MAX_US);
+  set_servo_deg(hpca, knee_ch, knee_deg, KNEE_MIN_US, KNEE_MAX_US);
+}
+
+static void Leg_SetPoseAll_Ch(PCA9685_Handle_t *hpca,
+                              uint8_t hip_ch, uint8_t knee_ch, uint8_t ext_ch,
+                              float hip_deg, float knee_deg, float ext_deg)
+{
+  hip_deg  = apply_inv(hip_deg,  INV_HIP);
+  knee_deg = apply_inv(knee_deg, INV_KNEE);
+  ext_deg  = apply_inv(ext_deg,  INV_EXT);
+
+  set_servo_deg(hpca, hip_ch,  hip_deg,  HIP_MIN_US,  HIP_MAX_US);
+  set_servo_deg(hpca, knee_ch, knee_deg, KNEE_MIN_US, KNEE_MAX_US);
+  set_servo_deg(hpca, ext_ch,  ext_deg,  EXT_MIN_US,  EXT_MAX_US);
+}
+
+// Convenience wrappers (front right is the leg we currently drive for walking)
+static void FR_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
+{
+  Leg_SetHipKnee_Ch(hpca, FR_HIP_CH, FR_KNEE_CH, hip_deg, knee_deg);
+}
+
+static void FR_SetPoseAll(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg, float ext_deg)
+{
+  Leg_SetPoseAll_Ch(hpca, FR_HIP_CH, FR_KNEE_CH, FR_EXT_CH, hip_deg, knee_deg, ext_deg);
+}
+
+
+static void AllLegs_FullOff(PCA9685_Handle_t *hpca)
+{
+  // Front right
+  (void)PCA9685_SetChannelFullOff(hpca, FR_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, FR_KNEE_CH, 1);
+  (void)PCA9685_SetChannelFullOff(hpca, FR_EXT_CH,  1);
+
+  // Front left
+  (void)PCA9685_SetChannelFullOff(hpca, FL_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, FL_KNEE_CH, 1);
+  (void)PCA9685_SetChannelFullOff(hpca, FL_EXT_CH,  1);
+
+  // Back right
+  (void)PCA9685_SetChannelFullOff(hpca, BR_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, BR_KNEE_CH, 1);
+
+  // Back left
+  (void)PCA9685_SetChannelFullOff(hpca, BL_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, BL_KNEE_CH, 1);
+}
+
+static void EnableFrontWalkOutputs(PCA9685_Handle_t *hpca)
+{
+  // Enable hip+knee for BOTH front legs; keep extension FULL OFF
+  (void)PCA9685_SetChannelFullOff(hpca, FR_HIP_CH,  0);
+  (void)PCA9685_SetChannelFullOff(hpca, FR_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(hpca, FR_EXT_CH,  1);
+
+  (void)PCA9685_SetChannelFullOff(hpca, FL_HIP_CH,  0);
+  (void)PCA9685_SetChannelFullOff(hpca, FL_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(hpca, FL_EXT_CH,  1);
+}
+
+static void UART_Sendf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (len <= 0) return;
+  if (len > (int)sizeof(buf)) len = (int)sizeof(buf);
+  (void)HAL_UART_Transmit(&huart2, (uint8_t*)buf, (uint16_t)len, 200);
+}
+
+// Read one ASCII line (ending with \n). Non-blocking-ish: polls bytes with small timeout.
+// Returns 1 when a full line is captured into out (null-terminated). Returns 0 otherwise.
+static int UART_TryReadLine(char out[UART_LINE_MAX])
+{
+  static char line[UART_LINE_MAX];
+  static uint8_t idx = 0;
+
+  uint8_t b = 0;
+  if (HAL_UART_Receive(&huart2, &b, 1, UART_BYTE_TIMEOUT_MS) != HAL_OK)
+    return 0;
+
+  if (b == '\r')
+    return 0;
+
+  if (b == '\n')
+  {
+    line[idx] = '\0';
+    strncpy(out, line, UART_LINE_MAX);
+    out[UART_LINE_MAX - 1] = '\0';
+    idx = 0;
+    return 1;
+  }
+
+  if (idx < (UART_LINE_MAX - 1))
+    line[idx++] = (char)b;
+  else
+    idx = 0; // overflow -> reset
+
+  return 0;
+}
+
+static void str_to_upper(char *s)
+{
+  while (*s) { *s = (char)toupper((unsigned char)*s); s++; }
+}
+
+// Returns 1 if started (GO received). Can also catch STOP and keep waiting.
+static int UART_WaitForGO_WhileSafeDisabled(void)
+{
+  UART_Sendf("STM32 READY. Send %s\\n to start. Send %s\\n to stop.\\r\\n", TOKEN_GO, TOKEN_STOP);
+
+  char rx[UART_LINE_MAX];
+  // int walk_dir = +1; // reserved for future (+1=forward, -1=backward)
+
+  while (1)
+  {
+    if (UART_TryReadLine(rx))
+    {
+      str_to_upper(rx);
+
+      if (strcmp(rx, TOKEN_GO) == 0)
+      {
+        UART_Sendf("CONFIRMED. STARTING WALK.\\r\\n");
+        return 1;
+      }
+      if (strcmp(rx, TOKEN_STOP) == 0)
+      {
+        UART_Sendf("STOP ACK. Outputs remain disabled.\\r\\n");
+        // already disabled, keep waiting
+      }
+      else
+      {
+        UART_Sendf("UNKNOWN: '%s' (send %s)\\r\\n", rx, TOKEN_GO);
+      }
+    }
+  }
+}
+
+// Walking gait core: call repeatedly from main while(1).
+// dir = +1 (forward), dir = -1 (backward)
+// Extension (CH1) stays FULL OFF unless you enable it.
+static void Walking_GaitTask(PCA9685_Handle_t *hpca, uint32_t step_period_ms, int dir)
+{
+  static uint32_t t0 = 0;
+  if (t0 == 0)
+  {
+    const float start_phase = 0.30f;
+    uint32_t now = HAL_GetTick();
+    t0 = now - (uint32_t)(start_phase * (float)step_period_ms);
+  }
+
+  // Normalize dir defensively
+  if (dir >= 0) dir = 1;
+  else dir = -1;
+
+  float phase = (float)((HAL_GetTick() - t0) % step_period_ms) / (float)step_period_ms;
+
+  const float stance_end = 0.60f;
+
+  float hip  = FR_HIP_NEUTRAL_DEG;
+  float knee = FR_KNEE_NEUTRAL_DEG;
+
+  if (phase < stance_end)
+  {
+    float u = smoothstep(phase / stance_end);
+    hip  = FR_HIP_NEUTRAL_DEG - (float)dir * HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
+    knee = FR_KNEE_NEUTRAL_DEG + 7.0f;
+  }
+  else
+  {
+    float u = (phase - stance_end) / (1.0f - stance_end);
+    float s = smoothstep(u);
+
+    hip = FR_HIP_NEUTRAL_DEG + (float)dir * HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
+
+    float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
+    knee = FR_KNEE_NEUTRAL_DEG + (KNEE_BEND_AMPL_DEG * lift);
+  }
+
+  static uint32_t gait_start_tick = 0;
+  if (gait_start_tick == 0) gait_start_tick = HAL_GetTick();
+  float a = (float)(HAL_GetTick() - gait_start_tick) / (float)GAIT_RAMP_MS;
+  a = smoothstep(a);
+
+  hip  = FR_HIP_NEUTRAL_DEG  + a * (hip  - FR_HIP_NEUTRAL_DEG);
+  knee = FR_KNEE_NEUTRAL_DEG + a * (knee - FR_KNEE_NEUTRAL_DEG);
+
+  hip  = clampf(hip,  0.0f, 180.0f);
+  knee = clampf(knee, 0.0f, 180.0f);
+
+  FR_SetHipKnee(hpca, hip, knee);
+}
+
+// Wrapper: walking forward
+static void WalkingForward(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
+{
+  Walking_GaitTask(hpca, step_period_ms, +1);
+}
+
+// Wrapper: walking backward
+static void WalkingBackward(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
+{
+  Walking_GaitTask(hpca, step_period_ms, -1);
+}
+
+// Disable all PWM outputs (FULL OFF)
+static void PCA_AllOff(PCA9685_Handle_t *hpca)
+{
+  AllLegs_FullOff(hpca);
+}
+
+// Enable hip+knee, keep extension OFF
+static void PCA_EnableHipKnee(PCA9685_Handle_t *hpca)
+{
+  // Enable hip+knee outputs for the two front legs; keep all extension channels FULL OFF.
+  EnableFrontWalkOutputs(hpca);
+}
+
+/* Main ---------------------------------------------------------------------*/
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_USART2_UART_Init();
+  MX_I2C3_Init();
+
+  UART_Sendf("\\r\\nBOOT... UART2 OK @115200\\r\\n");
+
+  // Check PCA9685 is present
+  if (HAL_I2C_IsDeviceReady(&hi2c3, (PCA9685_ADDR_7BIT << 1), 5, 200) != HAL_OK)
+  {
+    UART_Sendf("ERROR: PCA9685 not responding on I2C3 addr 0x%02X\\r\\n", PCA9685_ADDR_7BIT);
+    while (1) { }
+  }
+
+  if (PCA9685_Init(&pca, &hi2c3, PCA9685_ADDR_7BIT, 50.0f) != HAL_OK)
+  {
+    UART_Sendf("ERROR: PCA9685_Init failed\\r\\n");
+    while (1) { }
+  }
+
+  // Safety: disable outputs so NOTHING moves until Jetson confirms
+  PCA_AllOff(&pca);
+  UART_Sendf("Outputs DISABLED (FULL OFF). Servos should NOT move.\\r\\n");
+  UART_Sendf("Neutral: H=%.1f K=%.1f E=%.1f\\r\\n", FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG, FR_EXT_NEUTRAL_DEG);
+
+  // Wait for Jetson "GO"
+  (void)UART_WaitForGO_WhileSafeDisabled();
+
+  // Start walking
+  PCA_EnableHipKnee(&pca);
+  FR_SetHipKnee(&pca, FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG);
+  HAL_Delay(START_HOLD_MS);
+
+  char rx[UART_LINE_MAX];
+  int walk_dir = +1; // +1=forward, -1=backward
+
+  while (1)
+  {
+    // Allow STOP at runtime
+    if (UART_TryReadLine(rx))
+    {
+      str_to_upper(rx);
+      if (strcmp(rx, TOKEN_STOP) == 0)
+      {
+        UART_Sendf("STOP RECEIVED. Disabling outputs.\\r\\n");
+        PCA_AllOff(&pca);
+
+        // Wait again for GO
+        (void)UART_WaitForGO_WhileSafeDisabled();
+
+        UART_Sendf("RE-STARTING WALK.\\r\\n");
+        PCA_EnableHipKnee(&pca);
+        FR_SetHipKnee(&pca, FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG);
+        HAL_Delay(START_HOLD_MS);
+      }
+else if (strcmp(rx, TOKEN_FWD) == 0)
+{
+  walk_dir = +1;
+  UART_Sendf("DIR: FORWARD\r\n");
+}
+else if (strcmp(rx, TOKEN_BACK) == 0)
+{
+  walk_dir = -1;
+  UART_Sendf("DIR: BACKWARD\r\n");
+}
+    }
+
+    if (walk_dir > 0) WalkingForward(&pca, STEP_PERIOD_MS);
+    else              WalkingBackward(&pca, STEP_PERIOD_MS);
+    HAL_Delay(CONTROL_DT_MS);
+  }
+}
+
+/* Clock / Peripherals ------------------------------------------------------*/
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 336;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { while (1) { } }
+
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) { while (1) { } }
+}
+
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK) { while (1) { } }
+}
+
+static void MX_I2C3_Init(void)
+{
+  hi2c3.Instance = I2C3;
+  hi2c3.Init.ClockSpeed = 100000;
+  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1 = 0;
+  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK) { while (1) { } }
+}
+
+static void MX_GPIO_Init(void)
+{
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+}
+
+/* USER CODE END */
