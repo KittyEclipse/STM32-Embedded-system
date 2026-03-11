@@ -32,8 +32,8 @@
 
 // ===== Channel mapping =====
 #define SERVO_HIP_CH               0
-#define SERVO_KNEE_CH              1
-#define SERVO_EXT_CH               2
+#define SERVO_KNEE_CH              2
+#define SERVO_EXT_CH               1
 
 // ===== Servo pulse ranges (tune per servo) =====
 #define HIP_MIN_US                 900.0f
