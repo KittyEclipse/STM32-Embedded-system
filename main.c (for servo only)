@@ -32,8 +32,8 @@
 
 // ===== Channel mapping =====
 #define SERVO_HIP_CH               0
-#define SERVO_KNEE_CH              2
-#define SERVO_EXT_CH               1
+#define SERVO_KNEE_CH              1
+#define SERVO_EXT_CH               2
 
 // ===== Servo pulse ranges (tune per servo) =====
 #define HIP_MIN_US                 900.0f
@@ -67,6 +67,8 @@
 // ===== UART tokens =====
 #define TOKEN_GO                   "GO"
 #define TOKEN_STOP                 "STOP"
+#define TOKEN_FWD                  "FWD"
+#define TOKEN_BACK                 "BACK"
 
 // ===== UART receive timeouts =====
 #define UART_BYTE_TIMEOUT_MS       10U
@@ -192,6 +194,7 @@ static int UART_WaitForGO_WhileSafeDisabled(void)
   UART_Sendf("STM32 READY. Send %s\\n to start. Send %s\\n to stop.\\r\\n", TOKEN_GO, TOKEN_STOP);
 
   char rx[UART_LINE_MAX];
+  int walk_dir = +1; // +1=forward, -1=backward
 
   while (1)
   {
@@ -217,9 +220,10 @@ static int UART_WaitForGO_WhileSafeDisabled(void)
   }
 }
 
-// Walking task: call repeatedly from main while(1).
+// Walking gait core: call repeatedly from main while(1).
+// dir = +1 (forward), dir = -1 (backward)
 // Extension (CH1) stays FULL OFF unless you enable it.
-static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
+static void Walking_GaitTask(PCA9685_Handle_t *hpca, uint32_t step_period_ms, int dir)
 {
   static uint32_t t0 = 0;
   if (t0 == 0)
@@ -228,6 +232,10 @@ static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
     uint32_t now = HAL_GetTick();
     t0 = now - (uint32_t)(start_phase * (float)step_period_ms);
   }
+
+  // Normalize dir defensively
+  if (dir >= 0) dir = 1;
+  else dir = -1;
 
   float phase = (float)((HAL_GetTick() - t0) % step_period_ms) / (float)step_period_ms;
 
@@ -239,7 +247,7 @@ static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
   if (phase < stance_end)
   {
     float u = smoothstep(phase / stance_end);
-    hip  = HIP_NEUTRAL_DEG - HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
+    hip  = HIP_NEUTRAL_DEG - (float)dir * HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
     knee = KNEE_NEUTRAL_DEG + 7.0f;
   }
   else
@@ -247,7 +255,7 @@ static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
     float u = (phase - stance_end) / (1.0f - stance_end);
     float s = smoothstep(u);
 
-    hip = HIP_NEUTRAL_DEG + HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
+    hip = HIP_NEUTRAL_DEG + (float)dir * HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
 
     float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
     knee = KNEE_NEUTRAL_DEG + (KNEE_BEND_AMPL_DEG * lift);
@@ -265,6 +273,18 @@ static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
   knee = clampf(knee, 0.0f, 180.0f);
 
   Leg_SetHipKnee(hpca, hip, knee);
+}
+
+// Wrapper: walking forward
+static void WalkingForward(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
+{
+  Walking_GaitTask(hpca, step_period_ms, +1);
+}
+
+// Wrapper: walking backward
+static void WalkingBackward(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
+{
+  Walking_GaitTask(hpca, step_period_ms, -1);
 }
 
 // Disable all PWM outputs (FULL OFF)
@@ -322,6 +342,7 @@ int main(void)
   HAL_Delay(START_HOLD_MS);
 
   char rx[UART_LINE_MAX];
+  int walk_dir = +1; // +1=forward, -1=backward
 
   while (1)
   {
@@ -342,9 +363,20 @@ int main(void)
         Leg_SetHipKnee(&pca, HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG);
         HAL_Delay(START_HOLD_MS);
       }
+else if (strcmp(rx, TOKEN_FWD) == 0)
+{
+  walk_dir = +1;
+  UART_Sendf("DIR: FORWARD\r\n");
+}
+else if (strcmp(rx, TOKEN_BACK) == 0)
+{
+  walk_dir = -1;
+  UART_Sendf("DIR: BACKWARD\r\n");
+}
     }
 
-    Walking_Task(&pca, STEP_PERIOD_MS);
+    if (walk_dir > 0) WalkingForward(&pca, STEP_PERIOD_MS);
+    else              WalkingBackward(&pca, STEP_PERIOD_MS);
     HAL_Delay(CONTROL_DT_MS);
   }
 }
