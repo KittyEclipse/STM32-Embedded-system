@@ -194,11 +194,12 @@ int main(void)
         if (send_line(fd, "GO") != 0) break;
         printf("Sent: GO\\n (waiting for confirm...)\n");
 
-        if (wait_for_token(fd, "GO RECEIVED", 3000)) {
-          printf("Confirm: STM32 accepted GO\n\n");
-        } else {
-          printf("No confirm received within 3s. Check wiring/baud or STM32 prints.\n\n");
-        }
+      if (wait_for_token(fd, "CONFIRMED. STARTING WALK.", 3000) ||
+          wait_for_token(fd, "GO RECEIVED", 3000)) {
+        printf("Confirm: STM32 accepted GO\n\n");
+      } else {
+        printf("No confirm received within 3s. Check wiring/baud or STM32 prints.\n\n");
+      }
       } else if (inbuf[0] == 's') {
         if (send_line(fd, "STOP") != 0) break;
         printf("Sent: STOP\\n (STM32 should return neutral + disable)\n\n");
