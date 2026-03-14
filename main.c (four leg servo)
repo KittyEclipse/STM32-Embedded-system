@@ -170,10 +170,25 @@ static void Leg_SetPoseAll_Ch(PCA9685_Handle_t *hpca,
   set_servo_deg(hpca, ext_ch,  ext_deg,  EXT_MIN_US,  EXT_MAX_US);
 }
 
-// Convenience wrappers (front right is the leg we currently drive for walking)
+// Convenience wrappers
 static void FR_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
 {
   Leg_SetHipKnee_Ch(hpca, FR_HIP_CH, FR_KNEE_CH, hip_deg, knee_deg);
+}
+
+static void FL_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
+{
+  Leg_SetHipKnee_Ch(hpca, FL_HIP_CH, FL_KNEE_CH, hip_deg, knee_deg);
+}
+
+static void BR_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
+{
+  Leg_SetHipKnee_Ch(hpca, BR_HIP_CH, BR_KNEE_CH, hip_deg, knee_deg);
+}
+
+static void BL_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
+{
+  Leg_SetHipKnee_Ch(hpca, BL_HIP_CH, BL_KNEE_CH, hip_deg, knee_deg);
 }
 
 static void FR_SetPoseAll(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg, float ext_deg)
@@ -181,6 +196,18 @@ static void FR_SetPoseAll(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg,
   Leg_SetPoseAll_Ch(hpca, FR_HIP_CH, FR_KNEE_CH, FR_EXT_CH, hip_deg, knee_deg, ext_deg);
 }
 
+static void FL_SetPoseAll(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg, float ext_deg)
+{
+  Leg_SetPoseAll_Ch(hpca, FL_HIP_CH, FL_KNEE_CH, FL_EXT_CH, hip_deg, knee_deg, ext_deg);
+}
+
+static void AllLegs_SetHipKneeNeutral(PCA9685_Handle_t *hpca)
+{
+  FR_SetHipKnee(hpca, FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG);
+  FL_SetHipKnee(hpca, FL_HIP_NEUTRAL_DEG, FL_KNEE_NEUTRAL_DEG);
+  BR_SetHipKnee(hpca, BR_HIP_NEUTRAL_DEG, BR_KNEE_NEUTRAL_DEG);
+  BL_SetHipKnee(hpca, BL_HIP_NEUTRAL_DEG, BL_KNEE_NEUTRAL_DEG);
+}
 
 static void AllLegs_FullOff(PCA9685_Handle_t *hpca)
 {
@@ -203,16 +230,25 @@ static void AllLegs_FullOff(PCA9685_Handle_t *hpca)
   (void)PCA9685_SetChannelFullOff(hpca, BL_KNEE_CH, 1);
 }
 
-static void EnableFrontWalkOutputs(PCA9685_Handle_t *hpca)
+static void EnableAllWalkOutputs(PCA9685_Handle_t *hpca)
 {
-  // Enable hip+knee for BOTH front legs; keep extension FULL OFF
+  // Front right
   (void)PCA9685_SetChannelFullOff(hpca, FR_HIP_CH,  0);
   (void)PCA9685_SetChannelFullOff(hpca, FR_KNEE_CH, 0);
   (void)PCA9685_SetChannelFullOff(hpca, FR_EXT_CH,  1);
 
+  // Front left
   (void)PCA9685_SetChannelFullOff(hpca, FL_HIP_CH,  0);
   (void)PCA9685_SetChannelFullOff(hpca, FL_KNEE_CH, 0);
   (void)PCA9685_SetChannelFullOff(hpca, FL_EXT_CH,  1);
+
+  // Back right
+  (void)PCA9685_SetChannelFullOff(hpca, BR_HIP_CH,  0);
+  (void)PCA9685_SetChannelFullOff(hpca, BR_KNEE_CH, 0);
+
+  // Back left
+  (void)PCA9685_SetChannelFullOff(hpca, BL_HIP_CH,  0);
+  (void)PCA9685_SetChannelFullOff(hpca, BL_KNEE_CH, 0);
 }
 
 static void UART_Sendf(const char *fmt, ...)
@@ -298,56 +334,88 @@ static int UART_WaitForGO_WhileSafeDisabled(void)
 // Walking gait core: call repeatedly from main while(1).
 // dir = +1 (forward), dir = -1 (backward)
 // Extension (CH1) stays FULL OFF unless you enable it.
-static void Walking_GaitTask(PCA9685_Handle_t *hpca, uint32_t step_period_ms, int dir)
+static void gait_compute_leg(float phase,
+                             float hip_neutral, float knee_neutral,
+                             int dir, float *hip_out, float *knee_out)
 {
-  static uint32_t t0 = 0;
-  if (t0 == 0)
-  {
-    const float start_phase = 0.30f;
-    uint32_t now = HAL_GetTick();
-    t0 = now - (uint32_t)(start_phase * (float)step_period_ms);
-  }
-
-  // Normalize dir defensively
-  if (dir >= 0) dir = 1;
-  else dir = -1;
-
-  float phase = (float)((HAL_GetTick() - t0) % step_period_ms) / (float)step_period_ms;
-
   const float stance_end = 0.60f;
-
-  float hip  = FR_HIP_NEUTRAL_DEG;
-  float knee = FR_KNEE_NEUTRAL_DEG;
+  float hip = hip_neutral;
+  float knee = knee_neutral;
 
   if (phase < stance_end)
   {
     float u = smoothstep(phase / stance_end);
-    hip  = FR_HIP_NEUTRAL_DEG - (float)dir * HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
-    knee = FR_KNEE_NEUTRAL_DEG + 7.0f;
+    hip  = hip_neutral - (float)dir * HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
+    knee = knee_neutral + 7.0f;
   }
   else
   {
     float u = (phase - stance_end) / (1.0f - stance_end);
     float s = smoothstep(u);
-
-    hip = FR_HIP_NEUTRAL_DEG + (float)dir * HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
+    hip = hip_neutral + (float)dir * HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
 
     float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
-    knee = FR_KNEE_NEUTRAL_DEG + (KNEE_BEND_AMPL_DEG * lift);
+    knee = knee_neutral + (KNEE_BEND_AMPL_DEG * lift);
   }
 
+  *hip_out = clampf(hip,  0.0f, 180.0f);
+  *knee_out = clampf(knee, 0.0f, 180.0f);
+}
+
+// Diagonal gait:
+// Pair A = Front Right + Back Left
+// Pair B = Front Left  + Back Right
+// Pair B is phase-shifted by 180 degrees from Pair A.
+static void Walking_GaitTask(PCA9685_Handle_t *hpca, uint32_t step_period_ms, int dir)
+{
+  static uint32_t t0 = 0;
   static uint32_t gait_start_tick = 0;
-  if (gait_start_tick == 0) gait_start_tick = HAL_GetTick();
-  float a = (float)(HAL_GetTick() - gait_start_tick) / (float)GAIT_RAMP_MS;
+
+  if (t0 == 0)
+  {
+    const float start_phase = 0.30f;
+    uint32_t now = HAL_GetTick();
+    t0 = now - (uint32_t)(start_phase * (float)step_period_ms);
+    gait_start_tick = now;
+  }
+
+  if (dir >= 0) dir = 1;
+  else dir = -1;
+
+  uint32_t now = HAL_GetTick();
+  float phase_a = (float)((now - t0) % step_period_ms) / (float)step_period_ms;
+  float phase_b = phase_a + 0.5f;
+  if (phase_b >= 1.0f) phase_b -= 1.0f;
+
+  float fr_hip, fr_knee, bl_hip, bl_knee;
+  float fl_hip, fl_knee, br_hip, br_knee;
+
+  gait_compute_leg(phase_a, FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG, dir, &fr_hip, &fr_knee);
+  gait_compute_leg(phase_a, BL_HIP_NEUTRAL_DEG, BL_KNEE_NEUTRAL_DEG, dir, &bl_hip, &bl_knee);
+
+  gait_compute_leg(phase_b, FL_HIP_NEUTRAL_DEG, FL_KNEE_NEUTRAL_DEG, dir, &fl_hip, &fl_knee);
+  gait_compute_leg(phase_b, BR_HIP_NEUTRAL_DEG, BR_KNEE_NEUTRAL_DEG, dir, &br_hip, &br_knee);
+
+  // Smooth ramp into gait from neutral
+  float a = (float)(now - gait_start_tick) / (float)GAIT_RAMP_MS;
   a = smoothstep(a);
 
-  hip  = FR_HIP_NEUTRAL_DEG  + a * (hip  - FR_HIP_NEUTRAL_DEG);
-  knee = FR_KNEE_NEUTRAL_DEG + a * (knee - FR_KNEE_NEUTRAL_DEG);
+  fr_hip  = FR_HIP_NEUTRAL_DEG + a * (fr_hip - FR_HIP_NEUTRAL_DEG);
+  fr_knee = FR_KNEE_NEUTRAL_DEG + a * (fr_knee - FR_KNEE_NEUTRAL_DEG);
 
-  hip  = clampf(hip,  0.0f, 180.0f);
-  knee = clampf(knee, 0.0f, 180.0f);
+  fl_hip  = FL_HIP_NEUTRAL_DEG + a * (fl_hip - FL_HIP_NEUTRAL_DEG);
+  fl_knee = FL_KNEE_NEUTRAL_DEG + a * (fl_knee - FL_KNEE_NEUTRAL_DEG);
 
-  FR_SetHipKnee(hpca, hip, knee);
+  br_hip  = BR_HIP_NEUTRAL_DEG + a * (br_hip - BR_HIP_NEUTRAL_DEG);
+  br_knee = BR_KNEE_NEUTRAL_DEG + a * (br_knee - BR_KNEE_NEUTRAL_DEG);
+
+  bl_hip  = BL_HIP_NEUTRAL_DEG + a * (bl_hip - BL_HIP_NEUTRAL_DEG);
+  bl_knee = BL_KNEE_NEUTRAL_DEG + a * (bl_knee - BL_KNEE_NEUTRAL_DEG);
+
+  FR_SetHipKnee(hpca, fr_hip, fr_knee);
+  FL_SetHipKnee(hpca, fl_hip, fl_knee);
+  BR_SetHipKnee(hpca, br_hip, br_knee);
+  BL_SetHipKnee(hpca, bl_hip, bl_knee);
 }
 
 // Wrapper: walking forward
@@ -371,8 +439,7 @@ static void PCA_AllOff(PCA9685_Handle_t *hpca)
 // Enable hip+knee, keep extension OFF
 static void PCA_EnableHipKnee(PCA9685_Handle_t *hpca)
 {
-  // Enable hip+knee outputs for the two front legs; keep all extension channels FULL OFF.
-  EnableFrontWalkOutputs(hpca);
+  EnableAllWalkOutputs(hpca);
 }
 
 /* Main ---------------------------------------------------------------------*/
@@ -410,7 +477,7 @@ int main(void)
 
   // Start walking
   PCA_EnableHipKnee(&pca);
-  FR_SetHipKnee(&pca, FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG);
+  AllLegs_SetHipKneeNeutral(&pca);
   HAL_Delay(START_HOLD_MS);
 
   char rx[UART_LINE_MAX];
@@ -432,7 +499,7 @@ int main(void)
 
         UART_Sendf("RE-STARTING WALK.\\r\\n");
         PCA_EnableHipKnee(&pca);
-        FR_SetHipKnee(&pca, FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG);
+        AllLegs_SetHipKneeNeutral(&pca);
         HAL_Delay(START_HOLD_MS);
       }
 else if (strcmp(rx, TOKEN_FWD) == 0)
