@@ -16,7 +16,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-DEFAULT_BAUD = 115200
+DEFAULT_BAUD = 9600
 WEB_PORT     = 8765
 LOG_MAXLEN   = 500
 
