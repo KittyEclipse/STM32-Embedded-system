@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """
-STM32 Terminal — Web-based UART interface for STM32F407 robot
-Run: python3 stm32_terminal.py [PORT] [BAUD]
-Then open: http://localhost:8765
+STM32 Control Center — Web-based UART interface for STM32F407 robot
+
+Run:
+    python main_improved.py
+or:
+    python main_improved.py COM4 9600
+
+Then open:
+    http://localhost:8765
 """
 
 import sys
@@ -16,9 +22,11 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-DEFAULT_BAUD = 9600 #change in main.c as well
-WEB_PORT     = 8765
-LOG_MAXLEN   = 500
+DEFAULT_PORT   = "COM4"
+DEFAULT_BAUD   = 9600   # Match STM32 main.c UART baud
+WEB_PORT       = 8765
+LOG_MAXLEN     = 800
+READ_TIMEOUT   = 0.05
 
 # ─── Global State ─────────────────────────────────────────────────────────────
 ser           = None
@@ -27,31 +35,47 @@ log_buf       = deque(maxlen=LOG_MAXLEN)
 log_lock      = threading.Lock()
 last_fetch_id = 0
 
-# Quick-command presets matching the STM32 protocol
 QUICK_CMDS = [
     ("GO",   "GO",   "Start walking"),
-    ("STOP", "STOP", "Stop & disable servos"),
-    ("FWD",  "FWD",  "Forward direction"),
-    ("BACK", "BACK", "Backward direction"),
+    ("STOP", "STOP", "Stop walking"),
+    ("FWD",  "FWD",  "Move forward"),
+    ("BACK", "BACK", "Move backward"),
     ("HELP", "HELP", "List commands"),
 ]
 
 # ─── Serial helpers ───────────────────────────────────────────────────────────
 def list_ports():
-    return [p.device for p in serial.tools.list_ports.comports()]
+    ports = [p.device for p in serial.tools.list_ports.comports()]
+    ports.sort(key=lambda p: (p != DEFAULT_PORT, p))
+    return ports
+
+def port_exists(port):
+    return port in list_ports()
 
 def open_serial(port, baud):
     global ser
     with ser_lock:
         if ser and ser.is_open:
             ser.close()
-        ser = serial.Serial(port, baud, timeout=0.05)
+        ser = serial.Serial(port, baud, timeout=READ_TIMEOUT)
+        # Give USB-UART a moment to settle
+        time.sleep(0.2)
+
+def close_serial():
+    global ser
+    with ser_lock:
+        if ser and ser.is_open:
+            ser.close()
+
+def is_connected():
+    with ser_lock:
+        return bool(ser and ser.is_open)
 
 def send_command(cmd):
     with ser_lock:
         if ser and ser.is_open:
             line = cmd.strip() + "\n"
-            ser.write(line.encode())
+            ser.write(line.encode("utf-8", errors="replace"))
             _log("TX", cmd.strip())
             return True
     return False
@@ -63,7 +87,7 @@ def _log(direction, text):
         log_buf.append({
             "id":   last_fetch_id,
             "ts":   time.strftime("%H:%M:%S"),
-            "dir":  direction,   # "TX", "RX", "SYS"
+            "dir":  direction,
             "text": text.rstrip()
         })
 
@@ -78,527 +102,627 @@ def serial_reader():
                 if line:
                     _log("RX", line.decode(errors="replace").rstrip())
             else:
-                time.sleep(0.2)
+                time.sleep(0.15)
         except Exception as e:
             _log("SYS", f"Read error: {e}")
-            time.sleep(1)
+            time.sleep(0.8)
 
-# ─── HTTP handler ─────────────────────────────────────────────────────────────
+# ─── UI HTML ──────────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>STM32 Terminal</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+<title>STM32 Control Center</title>
 <style>
-  :root {
-    --bg:       #080c0a;
-    --panel:    #0d1410;
-    --border:   #1a3028;
-    --green:    #00ff88;
-    --green-dim:#00c868;
-    --amber:    #ffb700;
-    --red:      #ff3c3c;
-    --cyan:     #00e5ff;
-    --text:     #b0d8c0;
-    --text-dim: #4a7058;
-    --glow:     0 0 8px #00ff8866;
-    --glow-hard:0 0 16px #00ff88aa;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 13px;
-    height: 100vh;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
+  :root{
+    --bg:#0b1020;
+    --bg-2:#121933;
+    --panel:#151d3a;
+    --panel-2:#1b2548;
+    --card:#1a2344;
+    --border:#2d3a6c;
+    --text:#eef3ff;
+    --muted:#9fb0da;
+    --accent:#6ea8fe;
+    --accent-2:#7cf5c9;
+    --success:#52d273;
+    --warn:#ffca5c;
+    --danger:#ff6b7a;
+    --shadow:0 12px 30px rgba(0,0,0,.28);
+    --radius:18px;
   }
 
-  /* ── Header ── */
-  header {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-    padding: 10px 18px;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
-    flex-shrink: 0;
-  }
-  header h1 {
-    font-family: 'Orbitron', monospace;
-    font-size: 14px;
-    font-weight: 900;
-    letter-spacing: 3px;
-    color: var(--green);
-    text-shadow: var(--glow);
-    white-space: nowrap;
-  }
-  .blink { animation: blink 1.1s step-end infinite; }
-  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
-
-  .status-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--red);
-    box-shadow: 0 0 6px var(--red);
-    flex-shrink: 0;
-    transition: background 0.3s, box-shadow 0.3s;
-  }
-  .status-dot.connected {
-    background: var(--green);
-    box-shadow: 0 0 8px var(--green);
-    animation: pulse 2s ease-in-out infinite;
-  }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
-
-  .status-label {
-    font-size: 11px;
-    color: var(--text-dim);
-    letter-spacing: 1px;
-  }
-  .status-label span { color: var(--green); }
-
-  header .spacer { flex: 1; }
-
-  /* ── Connection bar ── */
-  #conn-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 18px;
-    border-bottom: 1px solid var(--border);
-    background: #0a120e;
-    flex-shrink: 0;
-    flex-wrap: wrap;
-  }
-  #conn-bar label { color: var(--text-dim); font-size: 11px; letter-spacing:1px; }
-  select, input[type=text], input[type=number] {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--green);
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 12px;
-    padding: 4px 8px;
-    outline: none;
-    border-radius: 2px;
-  }
-  select:focus, input:focus { border-color: var(--green); box-shadow: var(--glow); }
-  #port-select { min-width: 160px; }
-  #baud-select { width: 100px; }
-
-  button {
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 12px;
-    letter-spacing: 1px;
-    padding: 5px 14px;
-    border: 1px solid var(--green-dim);
-    background: transparent;
-    color: var(--green);
-    cursor: pointer;
-    border-radius: 2px;
-    transition: all 0.15s;
-  }
-  button:hover { background: #00ff8820; box-shadow: var(--glow); }
-  button:active { background: #00ff8840; }
-  button.danger { border-color: var(--red); color: var(--red); }
-  button.danger:hover { background: #ff3c3c20; box-shadow: 0 0 8px #ff3c3c66; }
-  button.amber { border-color: var(--amber); color: var(--amber); }
-  button.amber:hover { background: #ffb70020; }
-
-  /* ── Main layout ── */
-  main {
-    display: flex;
-    flex: 1;
-    overflow: hidden;
-    gap: 0;
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;
+    font-family:Inter,Segoe UI,Arial,sans-serif;
+    color:var(--text);
+    background:
+      radial-gradient(circle at top left, #223468 0%, transparent 28%),
+      radial-gradient(circle at top right, #173253 0%, transparent 22%),
+      linear-gradient(180deg, #0a1020 0%, #0f1730 100%);
+    overflow:hidden;
   }
 
-  /* ── Terminal panel ── */
-  #terminal-wrap {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    border-right: 1px solid var(--border);
-    overflow: hidden;
-  }
-  #terminal-header {
-    padding: 6px 14px;
-    font-size: 10px;
-    letter-spacing: 2px;
-    color: var(--text-dim);
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-shrink: 0;
-  }
-  #log {
-    flex: 1;
-    overflow-y: auto;
-    padding: 10px 14px;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
-  }
-  #log::-webkit-scrollbar { width: 4px; }
-  #log::-webkit-scrollbar-thumb { background: var(--border); }
-
-  .log-line {
-    display: flex;
-    gap: 10px;
-    align-items: baseline;
-    line-height: 1.6;
-    animation: fadein 0.15s ease;
-  }
-  @keyframes fadein { from{opacity:0;transform:translateY(2px)} to{opacity:1;transform:none} }
-
-  .log-ts   { color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
-  .log-dir  { font-size: 10px; font-weight: bold; flex-shrink:0; width: 28px; text-align:center; letter-spacing:1px; }
-  .log-text { word-break: break-all; }
-
-  .dir-rx { color: var(--green); }
-  .dir-tx { color: var(--amber); }
-  .dir-sys{ color: var(--cyan); }
-
-  .text-rx { color: var(--text); }
-  .text-tx { color: var(--amber); }
-  .text-sys{ color: var(--cyan); }
-
-  /* OK/FAIL highlights */
-  .hl-ok   { color: var(--green); text-shadow: var(--glow); }
-  .hl-fail { color: var(--red);   text-shadow: 0 0 8px #ff3c3c88; }
-  .hl-ready{ color: var(--cyan);  text-shadow: 0 0 6px #00e5ff88; }
-
-  /* ── Input bar ── */
-  #input-bar {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 14px;
-    border-top: 1px solid var(--border);
-    background: var(--panel);
-    flex-shrink: 0;
-  }
-  #prompt { color: var(--green); font-size: 14px; text-shadow: var(--glow); }
-  #cmd-input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    border-bottom: 1px solid var(--border);
-    color: var(--green);
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 13px;
-    padding: 2px 4px;
-    outline: none;
-    caret-color: var(--green);
-  }
-  #cmd-input:focus { border-bottom-color: var(--green); box-shadow: 0 1px 0 var(--green); }
-  #cmd-input::placeholder { color: var(--text-dim); }
-
-  /* ── Right sidebar ── */
-  #sidebar {
-    width: 200px;
-    display: flex;
-    flex-direction: column;
-    flex-shrink: 0;
-    background: var(--panel);
-    overflow-y: auto;
-    scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
+  .app{
+    height:100%;
+    display:grid;
+    grid-template-rows:auto auto 1fr;
+    gap:14px;
+    padding:16px;
   }
 
-  .sidebar-section {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-  }
-  .sidebar-section h3 {
-    font-family: 'Orbitron', monospace;
-    font-size: 9px;
-    letter-spacing: 2px;
-    color: var(--text-dim);
-    margin-bottom: 8px;
+  .topbar, .toolbar, .panel, .sidebar-card{
+    background:rgba(21,29,58,.92);
+    backdrop-filter:blur(10px);
+    border:1px solid rgba(114,143,216,.18);
+    box-shadow:var(--shadow);
   }
 
-  .quick-btn {
-    display: block;
-    width: 100%;
-    margin-bottom: 5px;
-    padding: 6px 10px;
-    text-align: left;
-    font-size: 12px;
+  .topbar{
+    border-radius:20px;
+    display:flex;
+    align-items:center;
+    gap:14px;
+    padding:16px 18px;
   }
-  .quick-btn .qb-cmd  { color: var(--green); }
-  .quick-btn .qb-desc { display:block; font-size:10px; color: var(--text-dim); margin-top:1px; }
 
-  .quick-btn.go-btn   { border-color: var(--green); }
-  .quick-btn.stop-btn { border-color: var(--red); color: var(--red); }
-  .quick-btn.stop-btn .qb-cmd { color: var(--red); }
-
-  /* stats */
-  .stat-row { display:flex; justify-content:space-between; margin-bottom:4px; font-size:11px; }
-  .stat-row .sk { color: var(--text-dim); }
-  .stat-row .sv { color: var(--green); }
-
-  /* custom cmd */
-  #custom-form { display:flex; flex-direction:column; gap:5px; }
-  #custom-input {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    color: var(--green);
-    font-family: 'Share Tech Mono', monospace;
-    font-size: 12px;
-    padding: 5px 8px;
-    outline: none;
-    border-radius: 2px;
-    width: 100%;
+  .brand{
+    display:flex;
+    align-items:center;
+    gap:14px;
+    min-width:0;
   }
-  #custom-input:focus { border-color: var(--green); }
-  #custom-send { width: 100%; }
 
-  /* scan / refresh */
-  .icon-btn {
-    background: transparent;
-    border: none;
-    color: var(--text-dim);
-    cursor: pointer;
-    font-size: 13px;
-    padding: 2px 5px;
+  .logo{
+    width:44px;height:44px;border-radius:14px;
+    display:grid;place-items:center;
+    background:linear-gradient(135deg, var(--accent), var(--accent-2));
+    color:#08101f;
+    font-weight:800;
+    font-size:18px;
   }
-  .icon-btn:hover { color: var(--green); }
 
-  /* scanline overlay */
-  body::after {
-    content: '';
-    position: fixed; inset: 0;
-    background: repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 2px,
-      rgba(0,0,0,0.04) 2px,
-      rgba(0,0,0,0.04) 4px
-    );
-    pointer-events: none;
-    z-index: 9999;
+  .title-wrap h1{
+    margin:0;
+    font-size:1.25rem;
+    font-weight:800;
+    letter-spacing:.02em;
+  }
+  .title-wrap p{
+    margin:4px 0 0 0;
+    color:var(--muted);
+    font-size:.92rem;
+  }
+
+  .spacer{flex:1}
+
+  .status{
+    display:flex;
+    align-items:center;
+    gap:10px;
+    padding:10px 14px;
+    border-radius:999px;
+    background:rgba(255,255,255,.03);
+    border:1px solid rgba(255,255,255,.06);
+    white-space:nowrap;
+  }
+
+  .dot{
+    width:10px;height:10px;border-radius:50%;
+    background:var(--danger);
+    box-shadow:0 0 0 4px rgba(255,107,122,.15);
+  }
+  .dot.connected{
+    background:var(--success);
+    box-shadow:0 0 0 4px rgba(82,210,115,.15);
+  }
+
+  .toolbar{
+    border-radius:20px;
+    padding:14px 16px;
+    display:flex;
+    flex-wrap:wrap;
+    gap:12px;
+    align-items:end;
+  }
+
+  .field{
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+    min-width:180px;
+  }
+  .field.small{min-width:120px}
+  .field label{
+    color:var(--muted);
+    font-size:.8rem;
+    font-weight:700;
+    letter-spacing:.03em;
+  }
+
+  select,input[type=text]{
+    width:100%;
+    background:var(--bg-2);
+    color:var(--text);
+    border:1px solid var(--border);
+    border-radius:14px;
+    padding:12px 14px;
+    font-size:.95rem;
+    outline:none;
+  }
+  select:focus,input[type=text]:focus{
+    border-color:var(--accent);
+    box-shadow:0 0 0 3px rgba(110,168,254,.18);
+  }
+
+  button{
+    border:none;
+    border-radius:14px;
+    padding:12px 16px;
+    font-size:.95rem;
+    font-weight:700;
+    cursor:pointer;
+    transition:.18s transform,.18s opacity,.18s box-shadow;
+  }
+  button:hover{transform:translateY(-1px)}
+  button:active{transform:translateY(0)}
+  button.primary{
+    background:linear-gradient(135deg, var(--accent), #8e96ff);
+    color:white;
+  }
+  button.secondary{
+    background:#25325f;
+    color:var(--text);
+  }
+  button.success{
+    background:linear-gradient(135deg, #3dbb67, #69dd87);
+    color:white;
+  }
+  button.warning{
+    background:linear-gradient(135deg, #f3b23e, #ffd36f);
+    color:#312200;
+  }
+  button.danger{
+    background:linear-gradient(135deg, #ef5e71, #ff8594);
+    color:white;
+  }
+
+  .layout{
+    min-height:0;
+    display:grid;
+    grid-template-columns:1.55fr .9fr;
+    gap:14px;
+  }
+
+  .panel{
+    border-radius:22px;
+    display:grid;
+    grid-template-rows:auto 1fr auto;
+    min-height:0;
+    overflow:hidden;
+  }
+
+  .panel-head{
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    padding:16px 18px;
+    border-bottom:1px solid rgba(255,255,255,.08);
+  }
+  .panel-head h2{
+    margin:0;
+    font-size:1rem;
+  }
+  .panel-head .muted{
+    color:var(--muted);
+    font-size:.9rem;
+  }
+
+  #log{
+    min-height:0;
+    overflow:auto;
+    padding:14px 16px;
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.015), rgba(255,255,255,.01)),
+      #0f1630;
+  }
+
+  .log-line{
+    display:grid;
+    grid-template-columns:76px 56px 1fr;
+    gap:10px;
+    align-items:start;
+    padding:10px 12px;
+    margin-bottom:8px;
+    border-radius:14px;
+    background:rgba(255,255,255,.025);
+    border:1px solid rgba(255,255,255,.04);
+  }
+
+  .log-ts{color:var(--muted); font-variant-numeric:tabular-nums;}
+  .log-dir{
+    font-weight:800;
+    text-align:center;
+    border-radius:999px;
+    padding:5px 8px;
+    font-size:.82rem;
+  }
+  .dir-rx{background:rgba(82,210,115,.14); color:#87f2a3;}
+  .dir-tx{background:rgba(255,202,92,.14); color:#ffd97d;}
+  .dir-sys{background:rgba(110,168,254,.14); color:#9ec3ff;}
+  .log-text{word-break:break-word; line-height:1.45;}
+
+  .hl-ok{color:#87f2a3;font-weight:700;}
+  .hl-fail{color:#ff96a1;font-weight:700;}
+  .hl-ready{color:#9ec3ff;font-weight:700;}
+
+  .inputbar{
+    display:flex;
+    gap:10px;
+    align-items:center;
+    padding:14px 16px 16px 16px;
+    border-top:1px solid rgba(255,255,255,.08);
+    background:rgba(255,255,255,.02);
+  }
+  .inputbar input{
+    flex:1;
+  }
+
+  .sidebar{
+    min-height:0;
+    display:grid;
+    gap:14px;
+    grid-template-rows:auto auto auto 1fr;
+  }
+
+  .sidebar-card{
+    border-radius:22px;
+    padding:16px;
+  }
+  .sidebar-card h3{
+    margin:0 0 12px 0;
+    font-size:.96rem;
+  }
+
+  .quick-grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:10px;
+  }
+  .quick-grid button{
+    text-align:left;
+    min-height:70px;
+  }
+  .quick-grid small{
+    display:block;
+    margin-top:6px;
+    opacity:.88;
+    font-weight:600;
+  }
+
+  .stats{
+    display:grid;
+    grid-template-columns:repeat(3, 1fr);
+    gap:10px;
+  }
+  .stat{
+    border-radius:16px;
+    background:rgba(255,255,255,.03);
+    border:1px solid rgba(255,255,255,.05);
+    padding:12px;
+  }
+  .stat .k{
+    color:var(--muted);
+    font-size:.8rem;
+    margin-bottom:4px;
+  }
+  .stat .v{
+    font-size:1.15rem;
+    font-weight:800;
+  }
+
+  .map{
+    color:var(--muted);
+    line-height:1.7;
+    font-size:.92rem;
+  }
+
+  .hint{
+    color:var(--muted);
+    font-size:.88rem;
+    line-height:1.55;
+  }
+
+  @media (max-width: 980px){
+    body{overflow:auto}
+    .layout{grid-template-columns:1fr}
+    .app{height:auto; min-height:100%}
   }
 </style>
 </head>
 <body>
+<div class="app">
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo">S</div>
+      <div class="title-wrap">
+        <h1>STM32 Control Center</h1>
+        <p>Cleaner UART terminal for your STM32F407 robot</p>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <div class="status">
+      <div class="dot" id="status-dot"></div>
+      <div id="status-text">Disconnected</div>
+    </div>
+  </div>
 
-<header>
-  <div class="status-dot" id="status-dot"></div>
-  <h1>STM32<span class="blink">_</span>TERMINAL</h1>
-  <div class="status-label" id="status-label">DISCONNECTED</div>
-  <div class="spacer"></div>
-  <div class="status-label" style="font-size:10px; color:var(--text-dim)">STM32F407 · PCA9685 · 4-LEG WALKER</div>
-</header>
+  <div class="toolbar">
+    <div class="field">
+      <label>Serial Port</label>
+      <select id="port-select"></select>
+    </div>
 
-<div id="conn-bar">
-  <label>PORT</label>
-  <select id="port-select">
-    <option value="">— select —</option>
-  </select>
-  <button class="icon-btn" onclick="refreshPorts()" title="Refresh ports">⟳</button>
-  <label>BAUD</label>
-  <select id="baud-select">
-    <option>9600</option>
-    <option>19200</option>
-    <option>38400</option>
-    <option selected>115200</option>
-    <option>230400</option>
-    <option>460800</option>
-    <option>921600</option>
-  </select>
-  <button id="conn-btn" onclick="toggleConnect()">CONNECT</button>
-  <button class="danger" onclick="clearLog()">CLEAR</button>
+    <div class="field small">
+      <label>Baud Rate</label>
+      <select id="baud-select">
+        <option selected>9600</option>
+        <option>19200</option>
+        <option>38400</option>
+        <option>57600</option>
+        <option>115200</option>
+      </select>
+    </div>
+
+    <button class="secondary" onclick="refreshPorts()">Refresh Ports</button>
+    <button class="primary" id="conn-btn" onclick="toggleConnect()">Connect</button>
+    <button class="secondary" onclick="sendHandshake()">Send HELLO</button>
+    <button class="danger" onclick="clearLog()">Clear Log</button>
+  </div>
+
+  <div class="layout">
+    <div class="panel">
+      <div class="panel-head">
+        <h2>UART Monitor</h2>
+        <div class="muted" id="line-count">0 lines</div>
+      </div>
+
+      <div id="log"></div>
+
+      <div class="inputbar">
+        <input id="cmd-input" type="text" placeholder="Type a command and press Enter" autocomplete="off"
+               onkeydown="onInputKey(event)">
+        <button class="primary" onclick="sendFromInput()">Send</button>
+      </div>
+    </div>
+
+    <div class="sidebar">
+      <div class="sidebar-card">
+        <h3>Quick Commands</h3>
+        <div class="quick-grid">
+          <button class="success" onclick="quickSend('GO')">GO<small>Start walking</small></button>
+          <button class="danger" onclick="quickSend('STOP')">STOP<small>Stop walking</small></button>
+          <button class="primary" onclick="quickSend('FWD')">FWD<small>Move forward</small></button>
+          <button class="warning" onclick="quickSend('BACK')">BACK<small>Move backward</small></button>
+        </div>
+      </div>
+
+      <div class="sidebar-card">
+        <h3>Custom Command</h3>
+        <div style="display:flex; gap:10px;">
+          <input id="custom-input" type="text" placeholder="Example: HELP"
+                 onkeydown="if(event.key==='Enter') sendCustom()">
+          <button class="primary" onclick="sendCustom()">Send</button>
+        </div>
+      </div>
+
+      <div class="sidebar-card">
+        <h3>Session Stats</h3>
+        <div class="stats">
+          <div class="stat"><div class="k">TX</div><div class="v" id="stat-tx">0</div></div>
+          <div class="stat"><div class="k">RX</div><div class="v" id="stat-rx">0</div></div>
+          <div class="stat"><div class="k">Uptime</div><div class="v" id="stat-uptime">—</div></div>
+        </div>
+      </div>
+
+      <div class="sidebar-card">
+        <h3>Servo Channel Map</h3>
+        <div class="map">
+          FR: CH0 hip / CH2 knee<br>
+          FL: CH3 hip / CH5 knee<br>
+          BR: CH6 hip / CH7 knee<br>
+          BL: CH8 hip / CH9 knee
+        </div>
+        <div class="hint" style="margin-top:12px;">
+          Tip: COM4 is auto-selected when available so you do not need to choose it every time.
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
-
-<main>
-  <div id="terminal-wrap">
-    <div id="terminal-header">
-      <span>UART MONITOR</span>
-      <span id="line-count" style="color:var(--text-dim)">0 lines</span>
-    </div>
-    <div id="log"></div>
-    <div id="input-bar">
-      <span id="prompt">&gt;</span>
-      <input id="cmd-input" type="text" placeholder="type command + enter..."
-             autocomplete="off" autocorrect="off" spellcheck="false"
-             onkeydown="onInputKey(event)">
-      <button onclick="sendFromInput()">SEND</button>
-    </div>
-  </div>
-
-  <div id="sidebar">
-    <div class="sidebar-section">
-      <h3>QUICK COMMANDS</h3>
-      <button class="quick-btn go-btn" onclick="quickSend('GO')">
-        <span class="qb-cmd">GO</span>
-        <span class="qb-desc">Start walking</span>
-      </button>
-      <button class="quick-btn stop-btn danger" onclick="quickSend('STOP')">
-        <span class="qb-cmd">STOP</span>
-        <span class="qb-desc">Disable servos</span>
-      </button>
-      <button class="quick-btn" onclick="quickSend('FWD')">
-        <span class="qb-cmd">FWD</span>
-        <span class="qb-desc">Forward direction</span>
-      </button>
-      <button class="quick-btn" onclick="quickSend('BACK')">
-        <span class="qb-cmd">BACK</span>
-        <span class="qb-desc">Backward direction</span>
-      </button>
-      <button class="quick-btn amber" onclick="quickSend('HELP')">
-        <span class="qb-cmd">HELP</span>
-        <span class="qb-desc">List commands</span>
-      </button>
-    </div>
-
-    <div class="sidebar-section">
-      <h3>CUSTOM COMMAND</h3>
-      <div id="custom-form">
-        <input id="custom-input" type="text" placeholder="e.g. STATUS"
-               onkeydown="if(event.key==='Enter') sendCustom()">
-        <button id="custom-send" onclick="sendCustom()">SEND</button>
-      </div>
-    </div>
-
-    <div class="sidebar-section">
-      <h3>SESSION STATS</h3>
-      <div class="stat-row"><span class="sk">TX</span><span class="sv" id="stat-tx">0</span></div>
-      <div class="stat-row"><span class="sk">RX</span><span class="sv" id="stat-rx">0</span></div>
-      <div class="stat-row"><span class="sk">UPTIME</span><span class="sv" id="stat-uptime">—</span></div>
-    </div>
-
-    <div class="sidebar-section">
-      <h3>CHANNEL MAP</h3>
-      <div style="font-size:10px; color:var(--text-dim); line-height:1.9;">
-        <div>FR: CH0 hip / CH2 knee</div>
-        <div>FL: CH3 hip / CH5 knee</div>
-        <div>BR: CH6 hip / CH7 knee</div>
-        <div>BL: CH8 hip / CH9 knee</div>
-      </div>
-    </div>
-  </div>
-</main>
 
 <script>
 let connected = false;
 let pollInterval = null;
+let uptimeInterval = null;
 let lastId = 0;
-let txCount = 0, rxCount = 0;
+let txCount = 0;
+let rxCount = 0;
 let connectTime = null;
 let cmdHistory = [];
 let histIdx = -1;
 
-// ─── Port management ───────────────────────────────────────────────────────
+function savePrefs() {
+  localStorage.setItem('stm32_port', document.getElementById('port-select').value);
+  localStorage.setItem('stm32_baud', document.getElementById('baud-select').value);
+}
+
+function loadPrefs() {
+  const baud = localStorage.getItem('stm32_baud');
+  if (baud) document.getElementById('baud-select').value = baud;
+}
+
 async function refreshPorts() {
   try {
-    const r = await fetch('/api/ports');
-    const d = await r.json();
+    const res = await fetch('/api/ports');
+    const data = await res.json();
     const sel = document.getElementById('port-select');
-    const cur = sel.value;
-    sel.innerHTML = '<option value="">— select —</option>';
-    d.ports.forEach(p => {
+    const saved = localStorage.getItem('stm32_port');
+    const current = sel.value;
+
+    sel.innerHTML = '';
+    if (!data.ports.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No serial ports found';
+      sel.appendChild(opt);
+      return;
+    }
+
+    data.ports.forEach((p) => {
       const o = document.createElement('option');
-      o.value = o.textContent = p;
-      if (p === cur) o.selected = true;
+      o.value = p;
+      o.textContent = p + (p === 'COM4' ? ' (default)' : '');
       sel.appendChild(o);
     });
-  } catch(e) { sysLog('Port refresh failed: ' + e); }
+
+    if (data.ports.includes(saved)) sel.value = saved;
+    else if (data.ports.includes(current)) sel.value = current;
+    else if (data.ports.includes('COM4')) sel.value = 'COM4';
+    else sel.value = data.ports[0];
+
+    savePrefs();
+  } catch (e) {
+    sysLog('Port refresh failed: ' + e);
+  }
 }
 
 async function toggleConnect() {
   if (!connected) {
     const port = document.getElementById('port-select').value;
-    const baud = document.getElementById('baud-select').value;
-    if (!port) { sysLog('Select a port first.'); return; }
+    const baud = parseInt(document.getElementById('baud-select').value);
+    if (!port) {
+      sysLog('No serial port selected.');
+      return;
+    }
     try {
-      const r = await fetch('/api/connect', {
+      const res = await fetch('/api/connect', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({port, baud: parseInt(baud)})
+        body: JSON.stringify({port, baud})
       });
-      const d = await r.json();
-      if (d.ok) {
-        setConnected(true);
+      const data = await res.json();
+      if (data.ok) {
+        setConnected(true, port);
+        savePrefs();
         startPoll();
-        sysLog(`Connected: ${port} @ ${baud} baud`);
+        sysLog(`Connected to ${port} @ ${baud} baud`);
       } else {
-        sysLog('Connect failed: ' + d.error);
+        sysLog('Connect failed: ' + data.error);
       }
-    } catch(e) { sysLog('Connect error: ' + e); }
+    } catch (e) {
+      sysLog('Connect error: ' + e);
+    }
   } else {
-    await fetch('/api/disconnect', {method:'POST'});
+    try {
+      await fetch('/api/disconnect', {method:'POST'});
+    } catch (_) {}
     setConnected(false);
     stopPoll();
     sysLog('Disconnected.');
   }
 }
 
-function setConnected(v) {
+function setConnected(v, port='') {
   connected = v;
-  document.getElementById('status-dot').className = 'status-dot' + (v ? ' connected' : '');
-  document.getElementById('status-label').innerHTML = v
-    ? 'CONNECTED <span>' + document.getElementById('port-select').value + '</span>'
-    : 'DISCONNECTED';
-  document.getElementById('conn-btn').textContent = v ? 'DISCONNECT' : 'CONNECT';
-  if (v) { connectTime = Date.now(); updateUptime(); setInterval(updateUptime, 1000); }
-  else connectTime = null;
+  const dot = document.getElementById('status-dot');
+  const label = document.getElementById('status-text');
+  const btn = document.getElementById('conn-btn');
+
+  dot.className = 'dot' + (v ? ' connected' : '');
+  label.textContent = v ? `Connected: ${port}` : 'Disconnected';
+  btn.textContent = v ? 'Disconnect' : 'Connect';
+
+  if (uptimeInterval) clearInterval(uptimeInterval);
+  if (v) {
+    connectTime = Date.now();
+    updateUptime();
+    uptimeInterval = setInterval(updateUptime, 1000);
+  } else {
+    connectTime = null;
+    document.getElementById('stat-uptime').textContent = '—';
+  }
 }
 
 function updateUptime() {
   if (!connectTime) return;
   const s = Math.floor((Date.now() - connectTime) / 1000);
-  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
   document.getElementById('stat-uptime').textContent =
-    (h?h+'h ':'') + (m?m+'m ':'') + sec+'s';
+    h ? `${h}h ${mm}m` : `${mm}m ${sec}s`;
 }
 
-// ─── Sending ───────────────────────────────────────────────────────────────
 async function sendCmd(cmd) {
-  if (!connected) { sysLog('Not connected.'); return; }
+  if (!connected) {
+    sysLog('Not connected.');
+    return;
+  }
   try {
-    const r = await fetch('/api/send', {
+    const res = await fetch('/api/send', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify({cmd})
     });
-    const d = await r.json();
-    if (d.ok) {
+    const data = await res.json();
+    if (data.ok) {
       txCount++;
       document.getElementById('stat-tx').textContent = txCount;
       cmdHistory.unshift(cmd);
       if (cmdHistory.length > 50) cmdHistory.pop();
       histIdx = -1;
     } else {
-      sysLog('Send failed: ' + d.error);
+      sysLog('Send failed: ' + data.error);
     }
-  } catch(e) { sysLog('Send error: ' + e); }
+  } catch (e) {
+    sysLog('Send error: ' + e);
+  }
 }
 
-function quickSend(cmd) { sendCmd(cmd); }
+function sendHandshake() {
+  sendCmd('HELLO');
+}
+
+function quickSend(cmd) {
+  sendCmd(cmd);
+}
 
 function sendFromInput() {
   const inp = document.getElementById('cmd-input');
-  const v = inp.value.trim();
-  if (v) { sendCmd(v); inp.value = ''; }
+  const value = inp.value.trim();
+  if (!value) return;
+  sendCmd(value);
+  inp.value = '';
 }
 
 function sendCustom() {
   const inp = document.getElementById('custom-input');
-  const v = inp.value.trim();
-  if (v) { sendCmd(v); inp.value = ''; }
+  const value = inp.value.trim();
+  if (!value) return;
+  sendCmd(value);
+  inp.value = '';
 }
 
 function onInputKey(e) {
-  if (e.key === 'Enter') { sendFromInput(); return; }
+  if (e.key === 'Enter') {
+    sendFromInput();
+    return;
+  }
   if (e.key === 'ArrowUp') {
     histIdx = Math.min(histIdx + 1, cmdHistory.length - 1);
     document.getElementById('cmd-input').value = cmdHistory[histIdx] || '';
@@ -611,90 +735,105 @@ function onInputKey(e) {
   }
 }
 
-// ─── Polling ───────────────────────────────────────────────────────────────
-function startPoll() { pollInterval = setInterval(poll, 100); }
-function stopPoll()  { clearInterval(pollInterval); }
+function startPoll() {
+  stopPoll();
+  pollInterval = setInterval(poll, 120);
+}
+
+function stopPoll() {
+  if (pollInterval) clearInterval(pollInterval);
+  pollInterval = null;
+}
 
 async function poll() {
   try {
-    const r = await fetch('/api/log?since=' + lastId);
-    const d = await r.json();
-    if (d.lines && d.lines.length) {
-      d.lines.forEach(renderLine);
-      lastId = d.lines[d.lines.length-1].id;
+    const res = await fetch('/api/log?since=' + lastId);
+    const data = await res.json();
+    if (data.lines && data.lines.length) {
+      data.lines.forEach(renderLine);
+      lastId = data.lines[data.lines.length - 1].id;
     }
-  } catch(e) {}
+  } catch (_) {}
 }
 
-// ─── Rendering ─────────────────────────────────────────────────────────────
 function renderLine(entry) {
   const log = document.getElementById('log');
-  const div = document.createElement('div');
-  div.className = 'log-line';
+  const row = document.createElement('div');
+  row.className = 'log-line';
 
-  const ts   = document.createElement('span');
+  const ts = document.createElement('div');
   ts.className = 'log-ts';
   ts.textContent = entry.ts;
 
-  const dir  = document.createElement('span');
+  const dir = document.createElement('div');
   dir.className = 'log-dir dir-' + entry.dir.toLowerCase();
   dir.textContent = entry.dir;
 
-  const txt  = document.createElement('span');
-  txt.className = 'log-text text-' + entry.dir.toLowerCase();
-  txt.innerHTML = highlight(escHtml(entry.text));
+  const txt = document.createElement('div');
+  txt.className = 'log-text';
+  txt.innerHTML = highlight(escapeHtml(entry.text));
 
-  if (entry.dir === 'RX') { rxCount++; document.getElementById('stat-rx').textContent = rxCount; }
+  if (entry.dir === 'RX') {
+    rxCount++;
+    document.getElementById('stat-rx').textContent = rxCount;
+  }
 
-  div.appendChild(ts); div.appendChild(dir); div.appendChild(txt);
-  log.appendChild(div);
+  row.appendChild(ts);
+  row.appendChild(dir);
+  row.appendChild(txt);
+  log.appendChild(row);
 
-  // auto-scroll
   log.scrollTop = log.scrollHeight;
-  document.getElementById('line-count').textContent = log.children.length + ' lines';
+  document.getElementById('line-count').textContent = `${log.children.length} lines`;
 }
 
-function escHtml(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function highlight(s) {
-  // [OK] green, [FAIL] red, READY/CONFIRMED/STARTING cyan
   s = s.replace(/\[OK\]/g, '<span class="hl-ok">[OK]</span>');
   s = s.replace(/\[FAIL\]/g, '<span class="hl-fail">[FAIL]</span>');
-  s = s.replace(/(READY|CONFIRMED|STARTING|CONNECTED|ALL SYSTEMS)/g,
-      '<span class="hl-ready">$1</span>');
-  s = s.replace(/(ERROR|FAIL|NOT RESPONDING)/g,
-      '<span class="hl-fail">$1</span>');
+  s = s.replace(/\b(READY|CONFIRMED|STARTING|CONNECTED|ALL SYSTEMS)\b/g, '<span class="hl-ready">$1</span>');
+  s = s.replace(/\b(ERROR|FAIL|NOT RESPONDING)\b/g, '<span class="hl-fail">$1</span>');
   return s;
 }
 
 function sysLog(msg) {
-  renderLine({id: --lastId, ts: new Date().toLocaleTimeString('en',{hour12:false}), dir:'SYS', text: msg});
+  const now = new Date();
+  const ts = now.toLocaleTimeString('en-GB', {hour12:false});
+  renderLine({id: --lastId, ts, dir:'SYS', text: msg});
 }
 
 function clearLog() {
   document.getElementById('log').innerHTML = '';
   document.getElementById('line-count').textContent = '0 lines';
-  txCount = rxCount = 0;
+  txCount = 0;
+  rxCount = 0;
   document.getElementById('stat-tx').textContent = '0';
   document.getElementById('stat-rx').textContent = '0';
 }
 
-// ─── Init ──────────────────────────────────────────────────────────────────
+document.getElementById('baud-select').addEventListener('change', savePrefs);
+document.getElementById('port-select').addEventListener('change', savePrefs);
+
+loadPrefs();
 refreshPorts();
+setInterval(refreshPorts, 3000);
 document.getElementById('cmd-input').focus();
-sysLog('STM32 Terminal ready. Select a port and click CONNECT.');
+sysLog('Ready. COM4 will be selected automatically when available.');
 </script>
 </body>
 </html>
 """
 
+# ─── HTTP handler ─────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args): pass  # silence HTTP logs
+    def log_message(self, *args):
+        pass
 
     def _json(self, code, obj):
-        body = json.dumps(obj).encode()
+        body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -702,101 +841,114 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/" or self.path == "/index.html":
-            body = HTML.encode()
+        if self.path in ("/", "/index.html"):
+            body = HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
 
-        elif self.path == "/api/ports":
-            self._json(200, {"ports": list_ports()})
+        if self.path == "/api/ports":
+            ports = list_ports()
+            self._json(200, {
+                "ports": ports,
+                "default_port": DEFAULT_PORT,
+                "default_available": DEFAULT_PORT in ports,
+                "connected": is_connected(),
+            })
+            return
 
-        elif self.path.startswith("/api/log"):
+        if self.path.startswith("/api/log"):
             since = 0
             if "since=" in self.path:
-                try: since = int(self.path.split("since=")[1])
-                except: pass
+                try:
+                    since = int(self.path.split("since=")[1])
+                except Exception:
+                    since = 0
             with log_lock:
                 lines = [e for e in log_buf if e["id"] > since]
             self._json(200, {"lines": lines})
+            return
 
-        else:
-            self._json(404, {"error": "not found"})
+        self._json(404, {"error": "not found"})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
-        try: body = json.loads(raw) if raw else {}
-        except: body = {}
+        try:
+            body = json.loads(raw) if raw else {}
+        except Exception:
+            body = {}
 
         if self.path == "/api/connect":
-            port = body.get("port", "")
+            port = body.get("port", DEFAULT_PORT)
             baud = int(body.get("baud", DEFAULT_BAUD))
             try:
                 open_serial(port, baud)
                 _log("SYS", f"Serial opened: {port} @ {baud}")
-                self._json(200, {"ok": True})
+                self._json(200, {"ok": True, "port": port, "baud": baud})
             except Exception as e:
                 self._json(200, {"ok": False, "error": str(e)})
+            return
 
-        elif self.path == "/api/disconnect":
-            with ser_lock:
-                global ser
-                if ser and ser.is_open:
-                    ser.close()
+        if self.path == "/api/disconnect":
+            close_serial()
             _log("SYS", "Serial closed.")
             self._json(200, {"ok": True})
+            return
 
-        elif self.path == "/api/send":
+        if self.path == "/api/send":
             cmd = body.get("cmd", "").strip()
             if not cmd:
                 self._json(200, {"ok": False, "error": "empty command"})
                 return
-            ok = send_command(cmd)
-            if ok:
+            if send_command(cmd):
                 self._json(200, {"ok": True})
             else:
                 self._json(200, {"ok": False, "error": "port not open"})
+            return
 
-        else:
-            self._json(404, {"error": "not found"})
-
+        self._json(404, {"error": "not found"})
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="STM32 Web Terminal")
-    parser.add_argument("port", nargs="?", default=None, help="Serial port (e.g. /dev/ttyUSB0 or COM3)")
-    parser.add_argument("baud", nargs="?", type=int, default=DEFAULT_BAUD)
+    parser.add_argument("port", nargs="?", default=DEFAULT_PORT, help="Serial port (default: COM4)")
+    parser.add_argument("baud", nargs="?", type=int, default=DEFAULT_BAUD, help="Baud rate (default: 9600)")
     args = parser.parse_args()
 
-    # Auto-connect if port given on CLI
-    if args.port:
+    # Auto-connect only if the requested port exists
+    if args.port and port_exists(args.port):
         try:
             open_serial(args.port, args.baud)
             _log("SYS", f"Auto-connected: {args.port} @ {args.baud}")
             print(f"[+] Auto-connected to {args.port} @ {args.baud}")
         except Exception as e:
             print(f"[!] Could not open {args.port}: {e}")
+    else:
+        if args.port:
+            print(f"[!] {args.port} not found. Open the UI and choose an available port.")
 
-    # Start reader thread
     t = threading.Thread(target=serial_reader, daemon=True)
     t.start()
 
-    # Start web server
     server = HTTPServer(("127.0.0.1", WEB_PORT), Handler)
     url = f"http://localhost:{WEB_PORT}"
-    print(f"[+] STM32 Terminal running at {url}")
-    print(f"[+] Open your browser → {url}")
+    print(f"[+] STM32 Control Center running at {url}")
+    print(f"[+] Default port: {DEFAULT_PORT}")
+    print(f"[+] Default baud: {DEFAULT_BAUD}")
     print(f"[+] Press Ctrl+C to quit\n")
 
     try:
         import webbrowser
         webbrowser.open(url)
-    except: pass
+    except Exception:
+        pass
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n[+] Shutting down.")
+        close_serial()
