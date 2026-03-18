@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : STM32F407 + PCA9685 (I2C3) leg walk, gated by UART2 confirm from Jetson
+  * @brief          : STM32F407 + PCA9685 DEBUG - only back-left leg enabled, BL hip offset test
   *
   * UART2 protocol (ASCII lines):
   *   - STM32 prints: "STM32 READY. Send GO"
@@ -75,6 +75,24 @@
 #define BL_HIP_NEUTRAL_DEG        100.0f
 #define BL_KNEE_NEUTRAL_DEG         0.0f
 
+// ===== Per-leg trim offsets (degrees) =====
+// Use these to mechanically balance each leg without changing the base gait.
+// Bottom-left/back-left hip was kicking too far back, so start with -20 deg trim.
+#define FR_HIP_OFFSET_DEG          0.0f
+#define FR_KNEE_OFFSET_DEG         0.0f
+
+#define FL_HIP_OFFSET_DEG          0.0f
+#define FL_KNEE_OFFSET_DEG         0.0f
+
+#define BR_HIP_OFFSET_DEG          0.0f
+#define BR_KNEE_OFFSET_DEG         0.0f
+
+#define BL_HIP_OFFSET_DEG         -95.0f
+#define BL_KNEE_OFFSET_DEG         0.0f
+
+// Keep back-left hip from rotating backward past neutral.
+#define BL_HIP_NO_BACKWARD_AT_INIT  1
+
 // ===== Invert directions if needed (0=no invert, 1=invert) =====
 #define INV_HIP                    0
 #define INV_KNEE                   0
@@ -88,7 +106,7 @@
 
 // ===== Gait amplitudes =====
 #define HIP_SWING_AMPL_DEG         36.0f
-#define KNEE_BEND_AMPL_DEG         85.0f
+#define KNEE_BEND_AMPL_DEG         60.0f
 #define EXT_LIFT_AMPL_DEG           0.0f
 
 // ===== UART tokens =====
@@ -203,10 +221,11 @@ static void FL_SetPoseAll(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg,
 
 static void AllLegs_SetHipKneeNeutral(PCA9685_Handle_t *hpca)
 {
-  FR_SetHipKnee(hpca, FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG);
-  FL_SetHipKnee(hpca, FL_HIP_NEUTRAL_DEG, FL_KNEE_NEUTRAL_DEG);
-  BR_SetHipKnee(hpca, BR_HIP_NEUTRAL_DEG, BR_KNEE_NEUTRAL_DEG);
-  BL_SetHipKnee(hpca, BL_HIP_NEUTRAL_DEG, BL_KNEE_NEUTRAL_DEG);
+  // DEBUG MODE: only back-left leg is active.
+  // FR_SetHipKnee(hpca, FR_HIP_NEUTRAL_DEG + FR_HIP_OFFSET_DEG, FR_KNEE_NEUTRAL_DEG + FR_KNEE_OFFSET_DEG);
+  // FL_SetHipKnee(hpca, FL_HIP_NEUTRAL_DEG + FL_HIP_OFFSET_DEG, FL_KNEE_NEUTRAL_DEG + FL_KNEE_OFFSET_DEG);
+  // BR_SetHipKnee(hpca, BR_HIP_NEUTRAL_DEG + BR_HIP_OFFSET_DEG, BR_KNEE_NEUTRAL_DEG + BR_KNEE_OFFSET_DEG);
+  BL_SetHipKnee(hpca, BL_HIP_NEUTRAL_DEG + BL_HIP_OFFSET_DEG, BL_KNEE_NEUTRAL_DEG + BL_KNEE_OFFSET_DEG);
 }
 
 static void AllLegs_FullOff(PCA9685_Handle_t *hpca)
@@ -230,23 +249,28 @@ static void AllLegs_FullOff(PCA9685_Handle_t *hpca)
   (void)PCA9685_SetChannelFullOff(hpca, BL_KNEE_CH, 1);
 }
 
+static void KeepFrontExtensionsDisabled(PCA9685_Handle_t *hpca)
+{
+  (void)PCA9685_SetPWM(hpca, FR_EXT_CH, 0, 0);
+  (void)PCA9685_SetPWM(hpca, FL_EXT_CH, 0, 0);
+  (void)PCA9685_SetChannelFullOff(hpca, FR_EXT_CH, 1);
+  (void)PCA9685_SetChannelFullOff(hpca, FL_EXT_CH, 1);
+}
+
 static void EnableAllWalkOutputs(PCA9685_Handle_t *hpca)
 {
-  // Front right
-  (void)PCA9685_SetChannelFullOff(hpca, FR_HIP_CH,  0);
-  (void)PCA9685_SetChannelFullOff(hpca, FR_KNEE_CH, 0);
+  // DEBUG MODE: only back-left leg is enabled.
+  (void)PCA9685_SetChannelFullOff(hpca, FR_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, FR_KNEE_CH, 1);
   (void)PCA9685_SetChannelFullOff(hpca, FR_EXT_CH,  1);
 
-  // Front left
-  (void)PCA9685_SetChannelFullOff(hpca, FL_HIP_CH,  0);
-  (void)PCA9685_SetChannelFullOff(hpca, FL_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(hpca, FL_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, FL_KNEE_CH, 1);
   (void)PCA9685_SetChannelFullOff(hpca, FL_EXT_CH,  1);
 
-  // Back right
-  (void)PCA9685_SetChannelFullOff(hpca, BR_HIP_CH,  0);
-  (void)PCA9685_SetChannelFullOff(hpca, BR_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(hpca, BR_HIP_CH,  1);
+  (void)PCA9685_SetChannelFullOff(hpca, BR_KNEE_CH, 1);
 
-  // Back left
   (void)PCA9685_SetChannelFullOff(hpca, BL_HIP_CH,  0);
   (void)PCA9685_SetChannelFullOff(hpca, BL_KNEE_CH, 0);
 }
@@ -346,7 +370,7 @@ static void gait_compute_leg(float phase,
   {
     float u = smoothstep(phase / stance_end);
     hip  = hip_neutral - (float)dir * HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
-    knee = knee_neutral + 7.0f;
+    knee = knee_neutral + 12.0f;
   }
   else
   {
@@ -412,9 +436,28 @@ static void Walking_GaitTask(PCA9685_Handle_t *hpca, uint32_t step_period_ms, in
   bl_hip  = BL_HIP_NEUTRAL_DEG + a * (bl_hip - BL_HIP_NEUTRAL_DEG);
   bl_knee = BL_KNEE_NEUTRAL_DEG + a * (bl_knee - BL_KNEE_NEUTRAL_DEG);
 
-  FR_SetHipKnee(hpca, fr_hip, fr_knee);
-  FL_SetHipKnee(hpca, fl_hip, fl_knee);
-  BR_SetHipKnee(hpca, br_hip, br_knee);
+  // Apply per-leg trim offsets after gait blending
+  fr_hip  += FR_HIP_OFFSET_DEG;
+  fr_knee += FR_KNEE_OFFSET_DEG;
+
+  fl_hip  += FL_HIP_OFFSET_DEG;
+  fl_knee += FL_KNEE_OFFSET_DEG;
+
+  br_hip  += BR_HIP_OFFSET_DEG;
+  br_knee += BR_KNEE_OFFSET_DEG;
+
+  bl_hip  += BL_HIP_OFFSET_DEG;
+  bl_knee += BL_KNEE_OFFSET_DEG;
+
+  if (BL_HIP_NO_BACKWARD_AT_INIT)
+  {
+    if (bl_hip < BL_HIP_NEUTRAL_DEG) bl_hip = BL_HIP_NEUTRAL_DEG;
+  }
+
+  // DEBUG MODE: comment out all legs except back-left.
+  // FR_SetHipKnee(hpca, fr_hip, fr_knee);
+  // FL_SetHipKnee(hpca, fl_hip, fl_knee);
+  // BR_SetHipKnee(hpca, br_hip, br_knee);
   BL_SetHipKnee(hpca, bl_hip, bl_knee);
 }
 
@@ -440,6 +483,7 @@ static void PCA_AllOff(PCA9685_Handle_t *hpca)
 static void PCA_EnableHipKnee(PCA9685_Handle_t *hpca)
 {
   EnableAllWalkOutputs(hpca);
+  KeepFrontExtensionsDisabled(hpca);
 }
 
 /* Main ---------------------------------------------------------------------*/
@@ -452,70 +496,45 @@ int main(void)
   MX_USART2_UART_Init();
   MX_I2C3_Init();
 
-  UART_Sendf("\\r\\nBOOT... UART2 OK @115200\\r\\n");
+  UART_Sendf("\r\nBOOT... UART2 OK @115200\r\n");
 
   // Check PCA9685 is present
   if (HAL_I2C_IsDeviceReady(&hi2c3, (PCA9685_ADDR_7BIT << 1), 5, 200) != HAL_OK)
   {
-    UART_Sendf("ERROR: PCA9685 not responding on I2C3 addr 0x%02X\\r\\n", PCA9685_ADDR_7BIT);
+    UART_Sendf("ERROR: PCA9685 not responding on I2C3 addr 0x%02X\r\n", PCA9685_ADDR_7BIT);
     while (1) { }
   }
 
   if (PCA9685_Init(&pca, &hi2c3, PCA9685_ADDR_7BIT, 50.0f) != HAL_OK)
   {
-    UART_Sendf("ERROR: PCA9685_Init failed\\r\\n");
+    UART_Sendf("ERROR: PCA9685_Init failed\r\n");
     while (1) { }
   }
 
-  // Safety: disable outputs so NOTHING moves until Jetson confirms
+  // Ignore Jetson/UART commands for this test.
+  // Auto-start diagonal walking FORWARD only.
+
+  // Immediately hard-disable front extensions so FR does not poke out at init.
+  KeepFrontExtensionsDisabled(&pca);
+
+  // Safety: disable outputs first
   PCA_AllOff(&pca);
-  UART_Sendf("Outputs DISABLED (FULL OFF). Servos should NOT move.\\r\\n");
-  UART_Sendf("Neutral: H=%.1f K=%.1f E=%.1f\\r\\n", FR_HIP_NEUTRAL_DEG, FR_KNEE_NEUTRAL_DEG, FR_EXT_NEUTRAL_DEG);
+  UART_Sendf("Outputs DISABLED (FULL OFF).\r\n");
+  UART_Sendf("DEBUG MODE: only BACK-LEFT leg enabled. Other legs commented out.\r\n");
+  UART_Sendf("BL_HIP_OFFSET_DEG = %.1f\r\n", BL_HIP_OFFSET_DEG);
+  UART_Sendf("Knee bend test limit = %.1f deg\r\n", KNEE_BEND_AMPL_DEG);
 
-  // Wait for Jetson "GO"
-  (void)UART_WaitForGO_WhileSafeDisabled();
-
-  // Start walking
+  // Enable all walk legs and send all to neutral
   PCA_EnableHipKnee(&pca);
+  KeepFrontExtensionsDisabled(&pca);
   AllLegs_SetHipKneeNeutral(&pca);
   HAL_Delay(START_HOLD_MS);
 
-  char rx[UART_LINE_MAX];
-  int walk_dir = +1; // +1=forward, -1=backward
+  UART_Sendf("AUTO WALK FORWARD START\r\n");
 
   while (1)
   {
-    // Allow STOP at runtime
-    if (UART_TryReadLine(rx))
-    {
-      str_to_upper(rx);
-      if (strcmp(rx, TOKEN_STOP) == 0)
-      {
-        UART_Sendf("STOP RECEIVED. Disabling outputs.\\r\\n");
-        PCA_AllOff(&pca);
-
-        // Wait again for GO
-        (void)UART_WaitForGO_WhileSafeDisabled();
-
-        UART_Sendf("RE-STARTING WALK.\\r\\n");
-        PCA_EnableHipKnee(&pca);
-        AllLegs_SetHipKneeNeutral(&pca);
-        HAL_Delay(START_HOLD_MS);
-      }
-else if (strcmp(rx, TOKEN_FWD) == 0)
-{
-  walk_dir = +1;
-  UART_Sendf("DIR: FORWARD\r\n");
-}
-else if (strcmp(rx, TOKEN_BACK) == 0)
-{
-  walk_dir = -1;
-  UART_Sendf("DIR: BACKWARD\r\n");
-}
-    }
-
-    if (walk_dir > 0) WalkingForward(&pca, STEP_PERIOD_MS);
-    else              WalkingBackward(&pca, STEP_PERIOD_MS);
+    WalkingForward(&pca, STEP_PERIOD_MS);
     HAL_Delay(CONTROL_DT_MS);
   }
 }
