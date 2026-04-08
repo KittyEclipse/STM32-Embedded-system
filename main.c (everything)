@@ -2,241 +2,695 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body
-  ******************************************************************************
-  * @attention
+  * @brief          : STM32F407 — Cat robot main firmware
   *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
+  * Features:
+  *   1. Sequential diagonal gait (FR→BL→FL→BR) via PCA9685 on I2C3
+  *   2. TTP223 touch sensors on GPIOE — tap & hold detection, 7 zones
+  *   3. BMI323 IMU on I2C1 — 100Hz accel+gyro, reported to Jetson at 20Hz (IMU_REPORT_MS=50)
   *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
+  * Touch sensor → GPIO pin mapping:
+  *   HEAD       PE7
+  *   CHIN       PE8
+  *   BELLY      PE9
+  *   BACK       PE10
+  *   TAIL       PE11
+  *   PAW_LEFT   PE12
+  *   PAW_RIGHT  PE13
+  *   (PE14, PE15 reserved / spare)
   *
+  * UART2 (115200 baud) — messages sent TO Jetson:
+  *   Touch tap  : "TOUCH HEAD\r\n"       (on release after short press)
+  *   Touch hold : "TOUCH HEAD HOLD\r\n"  (while held > HOLD_THRESH_MS)
+  *                "TOUCH HEAD RELEASE\r\n" (on release after hold)
+  *   IMU stream : "IMU ax ay az gx gy gz\r\n"  (every IMU_REPORT_MS)
+  *
+  * UART2 — commands received FROM Jetson:
+  *   GO | FWD | BACK | LEFT | RIGHT | PIVOT_LEFT | PIVOT_RIGHT | STOP
+  *
+  * I2C bus assignment:
+  *   I2C1 (PB6=SCL, PB9=SDA) → BMI323 IMU  (addr 0x68, SDO low)
+  *   I2C3                     → PCA9685 servo driver
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <string.h>
-#include <stdio.h>
 #include "usb_host.h"
-#include "bmi323.h"
-#include "mcp23017.h"
-#include "pca9685.h"
-#include "jetson_link.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "pca9685.h"
+#include "bmi323.h"
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+/* ---- Gait ---- */
+typedef struct {
+  int      running;
+  int      dir;
+  float    yaw;
+  uint32_t ramp_start_ms;
+  uint32_t t0;
+} GaitState;
+
+/* ---- Touch sensor ---- */
+typedef enum {
+  TOUCH_IDLE = 0,
+  TOUCH_DEBOUNCE,
+  TOUCH_ACTIVE,
+  TOUCH_HOLD
+} TouchState;
+
+typedef struct {
+  GPIO_TypeDef *port;
+  uint16_t      pin;
+  const char   *name;      /* e.g. "HEAD" */
+  TouchState    state;
+  uint32_t      press_ms;  /* tick when finger first detected */
+  uint8_t       hold_sent; /* 1 after HOLD message was sent */
+} TouchSensor;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SERVO_HIP_UPDOWN_CH   0
-#define SERVO_HIP_SIDE_CH     1
-#define SERVO_KNEE_CH         2
-#define HIP_MIN_US   1000.0f
-#define HIP_MAX_US   2000.0f
-#define SIDE_MIN_US  1000.0f
-#define SIDE_MAX_US  2000.0f
-#define KNEE_MIN_US  1000.0f
-#define KNEE_MAX_US  2000.0f
-#define TIMEOUT 100
-#define touch_time 2000
 
-#define SERVO_HIP_CH               0
-#define SERVO_EXT_CH               1
-#define EXT_MIN_US                 950.0f
-#define EXT_MAX_US                 2050.0f
-#define HIP_NEUTRAL_DEG            100.0f
-#define KNEE_NEUTRAL_DEG             0.0f
-#define EXT_NEUTRAL_DEG             55.0f
-#define INV_HIP                    0
-#define INV_KNEE                   0
-#define INV_EXT                    0
-#define CONTROL_DT_MS              15U
-#define STEP_PERIOD_MS             1100U
-#define START_HOLD_MS              1200U
-#define GAIT_RAMP_MS               1500U
-#define HIP_SWING_AMPL_DEG         36.0f
-#define KNEE_BEND_AMPL_DEG         85.0f
-#define EXT_LIFT_AMPL_DEG           0.0f
+/* =========================================================================
+   PCA9685 / servo
+   ========================================================================= */
+#define PCA9685_ADDR_7BIT   0x40
 
-#define WAKEUP_INTERVAL_SEC        (5U * 60U)
+#define FR_HIP_CH    0
+#define FR_KNEE_CH   2
+#define FR_EXT_CH    1
+#define FL_HIP_CH    3
+#define FL_KNEE_CH   5
+#define FL_EXT_CH    4
+#define BR_HIP_CH    6
+#define BR_KNEE_CH   7
+#define BL_HIP_CH    8
+#define BL_KNEE_CH   9
+
+#define HIP_MIN_US   900.0f
+#define HIP_MAX_US   2200.0f
+#define KNEE_MIN_US  900.0f
+#define KNEE_MAX_US  2200.0f
+
+#define FR_HIP_NEUTRAL  100.0f
+#define FR_KNEE_NEUTRAL   0.0f
+#define FL_HIP_NEUTRAL  100.0f
+#define FL_KNEE_NEUTRAL   0.0f
+#define BR_HIP_NEUTRAL   90.0f
+#define BR_KNEE_NEUTRAL  90.0f
+#define BL_HIP_NEUTRAL   90.0f
+#define BL_KNEE_NEUTRAL  40.0f  /* physically measured neutral angle */
+
+#define FR_HIP_TRIM   0.0f
+#define FR_KNEE_TRIM  0.0f
+#define FL_HIP_TRIM   0.0f
+#define FL_KNEE_TRIM  0.0f
+#define BR_HIP_TRIM   0.0f
+#define BR_KNEE_TRIM  0.0f
+#define BL_HIP_TRIM    0.0f
+#define BL_KNEE_TRIM  0.0f
+
+#define CONTROL_DT_MS      15U
+#define STEP_PERIOD_MS     1600U
+#define START_HOLD_MS      10000U
+#define GAIT_RAMP_MS       2000U
+#define PAIR_DELAY_PHASE   0.50f
+#define STANCE_END_PHASE   0.62f
+#define HIP_SWING_AMP      26.0f
+#define KNEE_BEND_AMP      52.0f
+#define KNEE_STANCE_BEND   14.0f
+#define YAW_BIAS_DEG       18.0f
+
+/* ---- Back-leg test parameters (tune these on the bench) ---- */
+#define BR_HIP_NEUTRAL_US    1550.0f  /* BR hip neutral — adjust until leg hangs level   */
+#define BL_HIP_NEUTRAL_US    1550.0f  /* BL hip neutral — same angle as BR (mirrored mount) */
+#define BR_KNEE_NEUTRAL_US   1550.0f  /* BR knee neutral — tune per physical mount          */
+#define BL_KNEE_NEUTRAL_US   1189.0f  /* BL knee neutral = 40° → 900+(40/180)*1300 = 1189  */
+/* BL hip servo is physically mirrored from BR: sweep direction must be inverted */
+#define BL_HIP_INVERTED      1
+#define TEST_HIP_AMP_US      650.0f  /* ±650 µs → full 900–2200 µs sweep */
+#define TEST_KNEE_AMP_US     380.0f  /* bend and kick amplitude */
+#define TEST_SWING_MS        400U    /* duration of one leg's swing */
+
+#define TOUCH_DEBOUNCE_MS  20U    /* ignore bounces shorter than this     */
+#define HOLD_THRESH_MS     600U   /* held this long → send HOLD message   */
+
+#define IMU_REPORT_MS      50U    /* send IMU line to Jetson every 50 ms  */
+#define BMI323_ADDR_7BIT   0x68u  /* SDO pin low                          */
+
+#define TOKEN_GO    "GO"
+#define TOKEN_STOP  "STOP"
+#define TOKEN_FWD   "FWD"
+#define TOKEN_BACK  "BACK"
+#define TOKEN_LEFT  "LEFT"
+#define TOKEN_RIGHT "RIGHT"
+
+#define UART_BYTE_TIMEOUT_MS 0U   /* 0 = non-blocking poll; avoids stalling the control loop */
+#define UART_LINE_MAX        32
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c3;
-
+I2S_HandleTypeDef hi2s3;
 SPI_HandleTypeDef hspi1;
-
 UART_HandleTypeDef huart2;
 
-RTC_HandleTypeDef hrtc;
-
 /* USER CODE BEGIN PV */
-uint8_t tx_data[] = "Hello Jetson!\r\n";
-uint8_t rx_data[32];
-char tx_buf[64];
 PCA9685_Handle_t pca;
-MCP23017_Handle_t mcp;
-static uint8_t last_touch_gpa0 = 0;
-static uint8_t last_touch_gpa1 = 0;
-static uint8_t last_touch_gpa2 = 0;
-static uint8_t last_touch_gpa3 = 0;
-static uint8_t last_touch_gpa4 = 0;
-static uint8_t last_touch_gpa5 = 0;
-static uint8_t last_touch_gpa6 = 0;
-static uint8_t last_touch_gpa7 = 0;
-static uint8_t last_touch_gpb0 = 0;
-static uint8_t last_touch_gpb1 = 0;
-static uint8_t last_touch_gpb2 = 0;
-static uint8_t last_touch_gpb3 = 0;
-static uint32_t press_start_gpa0 = 0;
-static uint32_t press_start_gpa1 = 0;
-static uint32_t press_start_gpa2 = 0;
-static uint32_t press_start_gpa3 = 0;
-static uint32_t press_start_gpa4 = 0;
-static uint32_t press_start_gpa5 = 0;
-static uint32_t press_start_gpa6 = 0;
-static uint8_t gait_toggle = 0;
-static uint8_t gait_hold = 0;
-static uint8_t gait_run_prev = 0;
-static uint32_t walk_t0 = 0;
-static uint32_t gait_start_tick = 0;
-BMI323_t imu;
-JetsonLink_t jl;
+GaitState        gait;
+BMI323_t         imu;
 
-static volatile uint8_t low_power_mode = 0;
+/* 7 touch zones wired to GPIOE */
+static TouchSensor g_touch[7] = {
+  { GPIOE, GPIO_PIN_7,  "HEAD"      },
+  { GPIOE, GPIO_PIN_8,  "CHIN"      },
+  { GPIOE, GPIO_PIN_9,  "BELLY"     },
+  { GPIOE, GPIO_PIN_10, "BACK"      },
+  { GPIOE, GPIO_PIN_11, "TAIL"      },
+  { GPIOE, GPIO_PIN_12, "PAW_LEFT"  },
+  { GPIOE, GPIO_PIN_13, "PAW_RIGHT" },
+};
+#define TOUCH_COUNT  (sizeof(g_touch) / sizeof(g_touch[0]))
+
+static uint32_t g_imu_last_report_ms = 0;
+static uint8_t  g_test_swing_leg     = 0;  /* 0 = BR, 1 = BL */
+static float    g_test_swing_ph      = 0.0f;
+static uint8_t  g_imu_ok             = 0; /* 0 until BMI323_Init succeeds */
+static uint8_t  g_servo_faults       = 0; /* consecutive PCA9685 write failures */
+#define SERVO_FAULT_MAX 5U                /* stop gait after this many in a row */
+
+/* ---- Non-blocking UART TX ring buffer ---- */
+#define UART_TX_BUF_SIZE 256U
+static uint8_t  uart_tx_buf[UART_TX_BUF_SIZE];
+static uint16_t uart_tx_head = 0;  /* producer index */
+static uint16_t uart_tx_tail = 0;  /* consumer index */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_I2S3_Init(void);
 static void MX_SPI1_Init(void);
+static void MX_I2C3_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_I2C3_Init(void);
-static void MX_RTC_Init(void);
 void MX_USB_HOST_Process(void);
 
 /* USER CODE BEGIN PFP */
+static float clampf(float v, float lo, float hi);
+static float smoothstep(float x);
+static float apply_inv(float deg, int inv);
+static float angle_to_us(float deg, float mn, float mx);
+static void  write_servo(uint8_t ch, float deg, float mn, float mx);
+static void  all_full_off(void);
+static void  disable_extensions(void);
 
+static void  UART_Sendf(const char *fmt, ...);
+static void  UART_TxService(void);
+static int   UART_TryReadLine(char out[UART_LINE_MAX]);
+static void  str_to_upper(char *s);
+
+static void  write_servo_us(uint8_t ch, float us)  __attribute__((unused));
+static void  BackLeg_Tick(float dt_ms)              __attribute__((unused));
+
+static void  Gait_Init(void);
+static void  Gait_Start(void);
+static void  gait_compute_leg(float phase, float hip_n, float knee_n,
+                               float dir, float amp,
+                               float *hip_out, float *knee_out);
+static void  Gait_Tick(float dt_ms);
+static void  Go_To_Neutral(void);
+static void  Handle_UART(void);
+
+static void  Touch_Init(void);
+static void  Touch_Tick(void);
+
+static void  IMU_Tick(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* =========================================================================
+   Math helpers
+   ========================================================================= */
 static float clampf(float v, float lo, float hi)
-{
-  if (v < lo) return lo;
-  if (v > hi) return hi;
-  return v;
-}
+{ return (v < lo) ? lo : (v > hi) ? hi : v; }
 
 static float smoothstep(float x)
-{
-  x = clampf(x, 0.0f, 1.0f);
-  return x * x * (3.0f - 2.0f * x);
-}
+{ x = clampf(x,0.0f,1.0f); return x*x*(3.0f - 2.0f*x); }
 
+/* =========================================================================
+   Servo helpers
+   ========================================================================= */
 static float apply_inv(float deg, int inv)
+{ return inv ? (180.0f - deg) : deg; }
+
+static float angle_to_us(float deg, float mn, float mx)
+{ deg = clampf(deg,0.0f,180.0f); return mn + (deg/180.0f)*(mx-mn); }
+
+static void write_servo(uint8_t ch, float deg, float mn, float mx)
 {
-  if (!inv) return deg;
-  return 180.0f - deg;
+  if (PCA9685_SetServoPulseUs(&pca, ch, (uint16_t)angle_to_us(deg,mn,mx)) != HAL_OK) {
+    if (++g_servo_faults >= SERVO_FAULT_MAX) {
+      gait.running = 0;
+      UART_Sendf("SERVO FAULT ch%u: I2C error, gait stopped\r\n", (unsigned)ch);
+    }
+  } else {
+    g_servo_faults = 0;
+  }
 }
 
-static float map_angle_to_pulse_us(float angle_deg, float min_us, float max_us)
+static void all_full_off(void)
 {
-  angle_deg = clampf(angle_deg, 0.0f, 180.0f);
-  return min_us + (angle_deg / 180.0f) * (max_us - min_us);
+  uint8_t chs[] = { FR_HIP_CH, FR_KNEE_CH, FR_EXT_CH,
+                    FL_HIP_CH, FL_KNEE_CH, FL_EXT_CH,
+                    BR_HIP_CH, BR_KNEE_CH,
+                    BL_HIP_CH, BL_KNEE_CH };
+  for (int i = 0; i < (int)(sizeof(chs)/sizeof(chs[0])); i++)
+    (void)PCA9685_SetChannelFullOff(&pca, chs[i], 1);
 }
 
-static void set_servo_deg(PCA9685_Handle_t *hpca, uint8_t ch,
-                          float deg, float min_us, float max_us)
+static void disable_extensions(void)
 {
-  float us = map_angle_to_pulse_us(deg, min_us, max_us);
-  (void)PCA9685_SetServoPulseUs(hpca, ch, us);
+  (void)PCA9685_SetChannelFullOff(&pca, FR_EXT_CH, 1);
+  (void)PCA9685_SetChannelFullOff(&pca, FL_EXT_CH, 1);
 }
 
-static void Leg_SetHipKnee(PCA9685_Handle_t *hpca, float hip_deg, float knee_deg)
-{
-  hip_deg  = apply_inv(hip_deg,  INV_HIP);
-  knee_deg = apply_inv(knee_deg, INV_KNEE);
+/* =========================================================================
+   Back-leg test helpers
+   ========================================================================= */
 
-  set_servo_deg(hpca, SERVO_HIP_CH,  hip_deg,  HIP_MIN_US,  HIP_MAX_US);
-  set_servo_deg(hpca, SERVO_KNEE_CH, knee_deg, KNEE_MIN_US, KNEE_MAX_US);
+/* Write a servo pulse directly in microseconds. Clamps to 900–2200 µs. */
+static void write_servo_us(uint8_t ch, float us)
+{
+  us = clampf(us, 900.0f, 2200.0f);
+  if (PCA9685_SetServoPulseUs(&pca, ch, (uint16_t)us) != HAL_OK) {
+    if (++g_servo_faults >= SERVO_FAULT_MAX) {
+      gait.running = 0;
+      UART_Sendf("SERVO FAULT ch%u\r\n", (unsigned)ch);
+    }
+  } else {
+    g_servo_faults = 0;
+  }
 }
 
-static void Walking_Reset(void)
+/* Back-leg test gait — BR (ch 6/7) and BL (ch 14/15) only.
+ *
+ * Hip  : full 900–2200 µs sweep (wide step).
+ *        Tune BR_HIP_NEUTRAL_US / BL_HIP_NEUTRAL_US so the leg hangs level.
+ *
+ * Knee : kick-back pattern —
+ *        first half of swing : bends up   (foot clears ground)
+ *        second half         : kicks back past neutral (cat push-off)
+ *        stance              : holds neutral
+ */
+static void BackLeg_Tick(float dt_ms)
 {
-  walk_t0 = 0;
-  gait_start_tick = 0;
-}
+  if (!gait.running) return;
 
-static void Walking_Task(PCA9685_Handle_t *hpca, uint32_t step_period_ms)
-{
-  if (walk_t0 == 0)
-  {
-    const float start_phase = 0.30f;
-    uint32_t now = HAL_GetTick();
-    walk_t0 = now - (uint32_t)(start_phase * (float)step_period_ms);
+  g_test_swing_ph += dt_ms / (float)TEST_SWING_MS;
+  if (g_test_swing_ph >= 1.0f) {
+    g_test_swing_leg ^= 1u;   /* BR → BL → BR ... */
+    g_test_swing_ph   = 0.0f;
   }
 
-  float phase = (float)((HAL_GetTick() - walk_t0) % step_period_ms) / (float)step_period_ms;
+  float s = smoothstep(g_test_swing_ph);
 
-  const float stance_end = 0.60f;
+  for (int leg = 0; leg < 2; leg++) {
+    uint8_t hip_ch   = (leg == 0) ? BR_HIP_CH          : BL_HIP_CH;
+    uint8_t knee_ch  = (leg == 0) ? BR_KNEE_CH         : BL_KNEE_CH;
+    float   hip_n    = (leg == 0) ? BR_HIP_NEUTRAL_US  : BL_HIP_NEUTRAL_US;
+    float   knee_n   = (leg == 0) ? BR_KNEE_NEUTRAL_US : BL_KNEE_NEUTRAL_US;
+    /* BL hip servo is physically mirrored: invert sweep direction */
+    float   hip_dir  = (leg == 0) ? +1.0f : (BL_HIP_INVERTED ? -1.0f : +1.0f);
+    float   hip_us, knee_us;
 
-  float hip  = HIP_NEUTRAL_DEG;
-  float knee = KNEE_NEUTRAL_DEG;
+    if (leg == (int)g_test_swing_leg) {
+      /* Swing: hip sweeps neutral ± AMP (direction inverted for BL) */
+      hip_us = hip_n + hip_dir * TEST_HIP_AMP_US * (2.0f * s - 1.0f);
 
-  if (phase < stance_end)
-  {
-    float u = smoothstep(phase / stance_end);
-    hip  = HIP_NEUTRAL_DEG - HIP_SWING_AMPL_DEG * (2.0f * u - 1.0f);
-    knee = KNEE_NEUTRAL_DEG + 7.0f;
+      /* Knee kick-back:
+         ph 0→0.5 : bends up from neutral (clearance)
+         ph 0.5→1 : kicks back past neutral (push-off) */
+      float ko;
+      if (g_test_swing_ph < 0.5f) {
+        ko = TEST_KNEE_AMP_US * smoothstep(g_test_swing_ph * 2.0f);
+      } else {
+        ko = TEST_KNEE_AMP_US * (1.0f - 2.0f * smoothstep((g_test_swing_ph - 0.5f) * 2.0f));
+      }
+      knee_us = knee_n + ko;
+    } else {
+      /* Stance: hold neutral */
+      hip_us  = hip_n;
+      knee_us = knee_n;
+    }
+
+    write_servo_us(hip_ch,  hip_us);
+    write_servo_us(knee_ch, knee_us);
   }
-  else
-  {
-    float u = (phase - stance_end) / (1.0f - stance_end);
-    float s = smoothstep(u);
+}
 
-    hip = HIP_NEUTRAL_DEG + HIP_SWING_AMPL_DEG * (2.0f * s - 1.0f);
+/* =========================================================================
+   UART helpers
+   ========================================================================= */
 
+/* Enqueue formatted string into the TX ring buffer. Bytes dropped if full. */
+static void UART_Sendf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (len <= 0) return;
+  if (len > (int)(sizeof(buf) - 1)) len = (int)(sizeof(buf) - 1);
+
+  for (int i = 0; i < len; i++) {
+    uint16_t next = (uart_tx_head + 1U) % UART_TX_BUF_SIZE;
+    if (next != uart_tx_tail) {  /* drop silently if ring is full */
+      uart_tx_buf[uart_tx_head] = (uint8_t)buf[i];
+      uart_tx_head = next;
+    }
+  }
+}
+
+/* Drain the TX ring into the UART as fast as the hardware allows.
+   Writes bytes while TXE (transmit data register empty) is set — no busy-wait,
+   no blocking. Exits as soon as the DR is occupied or the ring is empty. */
+static void UART_TxService(void)
+{
+  while (uart_tx_head != uart_tx_tail &&
+         __HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE)) {
+    huart2.Instance->DR = uart_tx_buf[uart_tx_tail];
+    uart_tx_tail = (uart_tx_tail + 1U) % UART_TX_BUF_SIZE;
+  }
+}
+
+static int UART_TryReadLine(char out[UART_LINE_MAX])
+{
+  static char    line[UART_LINE_MAX];
+  static uint8_t idx = 0;
+  uint8_t b = 0;
+  if (HAL_UART_Receive(&huart2, &b, 1, UART_BYTE_TIMEOUT_MS) != HAL_OK)
+    return 0;
+  if (b == '\r') return 0;
+  if (b == '\n') {
+    line[idx] = '\0';
+    strncpy(out, line, UART_LINE_MAX);
+    out[UART_LINE_MAX-1] = '\0';
+    idx = 0;
+    return 1;
+  }
+  if (idx < UART_LINE_MAX-1) line[idx++] = (char)b;
+  else idx = 0;
+  return 0;
+}
+
+static void str_to_upper(char *s)
+{ while (*s) { *s = (char)toupper((unsigned char)*s); s++; } }
+
+/* =========================================================================
+   Gait
+   ========================================================================= */
+static void Gait_Init(void)
+{
+  gait.running       = 0;
+  gait.dir           = +1;
+  gait.yaw           = 0.0f;
+  gait.ramp_start_ms = 0;
+  gait.t0            = 0;
+}
+
+static void gait_compute_leg(float phase, float hip_n, float knee_n,
+                              float dir, float amp,
+                              float *hip_out, float *knee_out)
+{
+  float hip, knee;
+  if (phase < STANCE_END_PHASE) {
+    float u = smoothstep(phase / STANCE_END_PHASE);
+    hip  = hip_n - dir * amp * (2.0f * u - 1.0f);
+    knee = knee_n + KNEE_STANCE_BEND;
+  } else {
+    float u    = (phase - STANCE_END_PHASE) / (1.0f - STANCE_END_PHASE);
+    float s    = smoothstep(u);
     float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
-    knee = KNEE_NEUTRAL_DEG + (KNEE_BEND_AMPL_DEG * lift);
+    hip  = hip_n + dir * amp * (2.0f * s - 1.0f);
+    knee = knee_n + KNEE_BEND_AMP * lift;
+  }
+  *hip_out  = clampf(hip,  0.0f, 180.0f);
+  *knee_out = clampf(knee, 0.0f, 180.0f);
+}
+
+static void Gait_Tick(float dt_ms)
+{
+  (void)dt_ms;
+  if (!gait.running) return;
+
+  uint32_t now = HAL_GetTick();
+  if (gait.t0 == 0) gait.t0 = now;
+
+  float phase_a = (float)((now - gait.t0) % STEP_PERIOD_MS) / (float)STEP_PERIOD_MS;
+  float phase_b = phase_a + PAIR_DELAY_PHASE;
+  if (phase_b >= 1.0f) phase_b -= 1.0f;
+
+  float ramp = smoothstep(clampf((float)(now - gait.ramp_start_ms)
+                                 / (float)GAIT_RAMP_MS, 0.0f, 1.0f));
+  float dir = (float)gait.dir;
+
+  float a_dir, b_dir, a_amp, b_amp;
+  if (dir == 0.0f) {
+    a_dir = gait.yaw;      b_dir = -gait.yaw;
+    a_amp = HIP_SWING_AMP; b_amp = HIP_SWING_AMP;
+  } else {
+    a_amp = HIP_SWING_AMP * clampf(1.0f + gait.yaw, 0.0f, 2.0f);
+    b_amp = HIP_SWING_AMP * clampf(1.0f - gait.yaw, 0.0f, 2.0f);
+    a_dir = dir; b_dir = dir;
   }
 
-  if (gait_start_tick == 0) gait_start_tick = HAL_GetTick();
-  float a = (float)(HAL_GetTick() - gait_start_tick) / (float)GAIT_RAMP_MS;
-  a = smoothstep(a);
+  float fr_hip, fr_knee, bl_hip, bl_knee;
+  float fl_hip, fl_knee, br_hip, br_knee;
 
-  hip  = HIP_NEUTRAL_DEG  + a * (hip  - HIP_NEUTRAL_DEG);
-  knee = KNEE_NEUTRAL_DEG + a * (knee - KNEE_NEUTRAL_DEG);
+  gait_compute_leg(phase_a, FR_HIP_NEUTRAL + FR_HIP_TRIM, FR_KNEE_NEUTRAL + FR_KNEE_TRIM,
+                   a_dir, a_amp, &fr_hip, &fr_knee);
+  gait_compute_leg(phase_a, BL_HIP_NEUTRAL + BL_HIP_TRIM, BL_KNEE_NEUTRAL + BL_KNEE_TRIM,
+                   a_dir, a_amp, &bl_hip, &bl_knee);
+  gait_compute_leg(phase_b, FL_HIP_NEUTRAL + FL_HIP_TRIM, FL_KNEE_NEUTRAL + FL_KNEE_TRIM,
+                   b_dir, b_amp, &fl_hip, &fl_knee);
+  gait_compute_leg(phase_b, BR_HIP_NEUTRAL + BR_HIP_TRIM, BR_KNEE_NEUTRAL + BR_KNEE_TRIM,
+                   b_dir, b_amp, &br_hip, &br_knee);
 
-  hip  = clampf(hip,  0.0f, 180.0f);
-  knee = clampf(knee, 0.0f, 180.0f);
+#define RAMP(val, n) ((n) + ramp * ((val) - (n)))
+  fr_hip  = RAMP(fr_hip,  FR_HIP_NEUTRAL  + FR_HIP_TRIM);
+  fr_knee = RAMP(fr_knee, FR_KNEE_NEUTRAL + FR_KNEE_TRIM);
+  bl_hip  = RAMP(bl_hip,  BL_HIP_NEUTRAL  + BL_HIP_TRIM);
+  bl_knee = RAMP(bl_knee, BL_KNEE_NEUTRAL + BL_KNEE_TRIM);
+  fl_hip  = RAMP(fl_hip,  FL_HIP_NEUTRAL  + FL_HIP_TRIM);
+  fl_knee = RAMP(fl_knee, FL_KNEE_NEUTRAL + FL_KNEE_TRIM);
+  br_hip  = RAMP(br_hip,  BR_HIP_NEUTRAL  + BR_HIP_TRIM);
+  br_knee = RAMP(br_knee, BR_KNEE_NEUTRAL + BR_KNEE_TRIM);
+#undef RAMP
 
-  Leg_SetHipKnee(hpca, hip, knee);
+  write_servo(FL_HIP_CH,  apply_inv(fl_hip,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FL_KNEE_CH, apply_inv(fl_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BL_HIP_CH,  apply_inv(bl_hip,  1), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_KNEE_CH, apply_inv(bl_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(fr_hip,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(fr_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(br_hip,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BR_KNEE_CH, apply_inv(br_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
 }
 
-static void EnterSleepUntilRTC(void)
+static void Go_To_Neutral(void)
 {
-  HAL_SuspendTick();
-  HAL_PWR_EnterSLEEPMode(PWR_LOWPOWERREGULATOR_ON, PWR_SLEEPENTRY_WFI);
-  HAL_ResumeTick();
+  write_servo(FL_HIP_CH,  apply_inv(FL_HIP_NEUTRAL  + FL_HIP_TRIM,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FL_KNEE_CH, apply_inv(FL_KNEE_NEUTRAL + FL_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BL_HIP_CH,  apply_inv(BL_HIP_NEUTRAL  + BL_HIP_TRIM,  1), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_KNEE_CH, apply_inv(BL_KNEE_NEUTRAL + BL_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(FR_HIP_NEUTRAL  + FR_HIP_TRIM,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(FR_KNEE_NEUTRAL + FR_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(BR_HIP_NEUTRAL  + BR_HIP_TRIM,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BR_KNEE_CH, apply_inv(BR_KNEE_NEUTRAL + BR_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
 }
+
+static void Gait_Start(void)
+{
+  gait.running       = 1;
+  gait.ramp_start_ms = HAL_GetTick();
+  gait.t0            = 0;
+}
+
+static void Handle_UART(void)
+{
+  char rx[UART_LINE_MAX];
+  if (!UART_TryReadLine(rx)) return;
+  str_to_upper(rx);
+
+  if (strcmp(rx, TOKEN_GO) == 0 || strcmp(rx, TOKEN_FWD) == 0) {
+    gait.dir = +1; gait.yaw = 0.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("FWD\r\n");
+  } else if (strcmp(rx, TOKEN_BACK) == 0) {
+    gait.dir = -1; gait.yaw = 0.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("BACK\r\n");
+  } else if (strcmp(rx, TOKEN_LEFT) == 0) {
+    gait.yaw = -1.0f;
+    if (gait.dir == 0) gait.dir = +1;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("LEFT\r\n");
+  } else if (strcmp(rx, TOKEN_RIGHT) == 0) {
+    gait.yaw = +1.0f;
+    if (gait.dir == 0) gait.dir = +1;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("RIGHT\r\n");
+  } else if (strcmp(rx, "PIVOT_LEFT") == 0) {
+    gait.dir = 0; gait.yaw = -1.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("PIVOT_LEFT\r\n");
+  } else if (strcmp(rx, "PIVOT_RIGHT") == 0) {
+    gait.dir = 0; gait.yaw = +1.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("PIVOT_RIGHT\r\n");
+  } else if (strcmp(rx, TOKEN_STOP) == 0) {
+    gait.running       = 0;
+    gait.dir           = +1;
+    gait.yaw           = 0.0f;
+    gait.ramp_start_ms = 0;
+    gait.t0            = 0;
+    Go_To_Neutral();
+    UART_Sendf("STOP ACK\r\n");
+  } else {
+    UART_Sendf("UNKNOWN: '%s'\r\n", rx);
+  }
+}
+
+/* =========================================================================
+   Touch sensors
+   =========================================================================
+   TTP223 output: HIGH = touched, LOW = not touched.
+   State machine per sensor:
+     IDLE      → pin goes HIGH  → enter DEBOUNCE, record press_ms
+     DEBOUNCE  → pin still HIGH after TOUCH_DEBOUNCE_MS → enter ACTIVE
+     DEBOUNCE  → pin goes LOW   → back to IDLE (noise)
+     ACTIVE    → held > HOLD_THRESH_MS → enter HOLD, send "TOUCH x HOLD"
+     ACTIVE    → pin goes LOW   → send "TOUCH x", back to IDLE (tap)
+     HOLD      → pin goes LOW   → send "TOUCH x RELEASE", back to IDLE
+   ========================================================================= */
+static void Touch_Init(void)
+{
+  for (int i = 0; i < (int)TOUCH_COUNT; i++) {
+    g_touch[i].state     = TOUCH_IDLE;
+    g_touch[i].press_ms  = 0;
+    g_touch[i].hold_sent = 0;
+  }
+}
+
+static void Touch_Tick(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  for (int i = 0; i < (int)TOUCH_COUNT; i++) {
+    TouchSensor *t   = &g_touch[i];
+    uint8_t      pin_hi = (HAL_GPIO_ReadPin(t->port, t->pin) == GPIO_PIN_SET)
+                          ? 1u : 0u;
+
+    switch (t->state) {
+
+      case TOUCH_IDLE:
+        if (pin_hi) {
+          t->state    = TOUCH_DEBOUNCE;
+          t->press_ms = now;
+        }
+        break;
+
+      case TOUCH_DEBOUNCE:
+        if (!pin_hi) {
+          /* Glitch — ignore */
+          t->state = TOUCH_IDLE;
+        } else if ((now - t->press_ms) >= TOUCH_DEBOUNCE_MS) {
+          t->state     = TOUCH_ACTIVE;
+          t->hold_sent = 0;
+        }
+        break;
+
+      case TOUCH_ACTIVE:
+        if (!pin_hi) {
+          /* Tap: released before hold threshold */
+          UART_Sendf("TOUCH %s\r\n", t->name);
+          t->state = TOUCH_IDLE;
+        } else if (!t->hold_sent &&
+                   (now - t->press_ms) >= HOLD_THRESH_MS) {
+          /* Crossed hold threshold */
+          UART_Sendf("TOUCH %s HOLD\r\n", t->name);
+          t->hold_sent = 1;
+          t->state     = TOUCH_HOLD;
+        }
+        break;
+
+      case TOUCH_HOLD:
+        if (!pin_hi) {
+          /* Released after hold */
+          UART_Sendf("TOUCH %s RELEASE\r\n", t->name);
+          t->state = TOUCH_IDLE;
+        }
+        break;
+
+      default:
+        t->state = TOUCH_IDLE;
+        break;
+    }
+  }
+}
+
+/* =========================================================================
+   IMU tick — read BMI323 and send to Jetson over UART2 every IMU_REPORT_MS
+   ========================================================================= */
+static void IMU_Tick(void)
+{
+  uint32_t now = HAL_GetTick();
+  if ((now - g_imu_last_report_ms) < IMU_REPORT_MS) return;
+  g_imu_last_report_ms = now;
+
+  BMI323_Sample_t s;
+  if (BMI323_ReadSample(&imu, &s) != HAL_OK) {
+    UART_Sendf("IMU ERROR\r\n");
+    return;
+  }
+
+  /* Format: "IMU ax ay az gx gy gz\r\n" with 3 decimal places.
+     Hand-formatted to avoid depending on -u _printf_float (not present in
+     this nano.specs build). Each field: [-]int.frac. */
+  #define FMT_F3(v) \
+    ((v) < 0.0f ? "-" : ""), \
+    (int)((v) < 0.0f ? -(v) : (v)), \
+    (int)(((v) < 0.0f ? -(v) : (v)) * 1000.0f + 0.5f) % 1000
+
+  UART_Sendf("IMU %s%d.%03d %s%d.%03d %s%d.%03d"
+             " %s%d.%03d %s%d.%03d %s%d.%03d\r\n",
+             FMT_F3(s.acc_g[0]),   FMT_F3(s.acc_g[1]),   FMT_F3(s.acc_g[2]),
+             FMT_F3(s.gyr_dps[0]), FMT_F3(s.gyr_dps[1]), FMT_F3(s.gyr_dps[2]));
+  #undef FMT_F3
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -245,325 +699,126 @@ static void EnterSleepUntilRTC(void)
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
-  /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_I2S3_Init();
   MX_SPI1_Init();
   MX_USB_HOST_Init();
+  MX_I2C3_Init();
   MX_USART2_UART_Init();
   MX_I2C1_Init();
-  MX_I2C3_Init();
-  MX_RTC_Init();
+
   /* USER CODE BEGIN 2 */
-	if (BMI323_Init(&imu, &hspi1, CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin) != HAL_OK) {
-		while(1) {}
-	}
 
-	if (BMI323_CalibrateBias(&imu, 200, 5) != HAL_OK) {
-		while(1) {}
-	}
+  UART_Sendf("\r\nBOOT OK @115200\r\n");
 
-	BMI323_ResetOdometry(&imu);
+  /* ---- PCA9685 (servo driver, I2C3) ---- */
+  if (HAL_I2C_IsDeviceReady(&hi2c3, (PCA9685_ADDR_7BIT << 1), 5, 200) != HAL_OK) {
+    UART_Sendf("ERROR: PCA9685 not found (I2C3 0x%02X)\r\n", PCA9685_ADDR_7BIT);
+    Error_Handler();
+  }
+  if (PCA9685_Init(&pca, &hi2c3, PCA9685_ADDR_7BIT, 50.0f) != HAL_OK) {
+    UART_Sendf("ERROR: PCA9685_Init failed\r\n");
+    Error_Handler();
+  }
+  disable_extensions();
+  all_full_off();
+  UART_Sendf("PCA9685 OK\r\n");
 
+  /* ---- Gait ---- */
+  Gait_Init();
+  Go_To_Neutral();
 
-	if (MCP23017_Init(&mcp, &hi2c1, (0x20 << 1)) != HAL_OK){
-		while(1) {}
-	}
-	for (uint8_t pin = 0; pin < 8; pin++) {
-	  MCP23017_PinMode(&mcp, MCP_PORTA, (MCP23017_Pin_t)pin, MCP_DIR_INPUT);
-	}
-	for (uint8_t pin = 0; pin < 4; pin++) {
-	  MCP23017_PinMode(&mcp, MCP_PORTB, (MCP23017_Pin_t)pin, MCP_DIR_INPUT);
-	}
-	if (PCA9685_Init(&pca, &hi2c3, (0x40 << 1), 50.0f) != HAL_OK)
-	{
-	while (1) {}
-	}
+  /* ---- BL channel diagnostic ---- */
+  {
+    /* Flush TX ring so boot messages actually transmit before HAL_Delay */
+    uint32_t t0 = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - t0) < 10U) UART_TxService();
 
-	PCA9685_SetServoPulseUs(&pca, 0, (HIP_MIN_US + HIP_MAX_US) * 0.5f);
-	PCA9685_SetServoPulseUs(&pca, 2, (KNEE_MIN_US + KNEE_MAX_US) * 0.5f);
+    HAL_StatusTypeDef bl_h = PCA9685_SetServoPulseUs(&pca, BL_HIP_CH,  1500U);
+    HAL_StatusTypeDef bl_k = PCA9685_SetServoPulseUs(&pca, BL_KNEE_CH, 1500U);
+    UART_Sendf("BL ch%u hip=%s ch%u knee=%s\r\n",
+               (unsigned)BL_HIP_CH,  bl_h == HAL_OK ? "OK" : "FAIL",
+               (unsigned)BL_KNEE_CH, bl_k == HAL_OK ? "OK" : "FAIL");
+    /* Hold 1500us (midpoint) for 800ms so you can see if BL servos respond */
+    t0 = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - t0) < 800U) UART_TxService();
+  }
 
-	JL_Init(&jl, &huart2);
-	JL_StartRx(&jl);
-	JL_SendHello(&jl);
+  UART_Sendf("At neutral. Holding %ums...\r\n", (unsigned)START_HOLD_MS);
+  { uint32_t t = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - t) < START_HOLD_MS) UART_TxService(); }
 
-	HAL_Delay(800);
+  /* ---- BMI323 (IMU, I2C1) ---- */
+  if (BMI323_Init(&imu, &hi2c1, BMI323_ADDR_7BIT) != HAL_OK) {
+    UART_Sendf("WARN: BMI323 not found (I2C1 0x%02X) — IMU disabled\r\n",
+               BMI323_ADDR_7BIT);
+    /* Non-fatal: cat still walks and responds to touch */
+  } else {
+    UART_Sendf("BMI323 OK. Calibrating bias (robot must be still)...\r\n");
+    /* 100 samples × 10 ms = ~1 second of stillness */
+    (void)BMI323_CalibrateBias(&imu, 100, 10);
+    UART_Sendf("IMU bias calibrated.\r\n");
+    g_imu_last_report_ms = HAL_GetTick();
+    g_imu_ok = 1;
+  }
 
-    (void)PCA9685_SetChannelFullOff(&pca, SERVO_HIP_CH,  1);
-    (void)PCA9685_SetChannelFullOff(&pca, SERVO_KNEE_CH, 1);
-    (void)PCA9685_SetChannelFullOff(&pca, SERVO_EXT_CH,  1);
+  /* ---- Touch sensors ---- */
+  Touch_Init();
 
-    (void)PCA9685_SetChannelFullOff(&pca, SERVO_HIP_CH,  0);
-    (void)PCA9685_SetChannelFullOff(&pca, SERVO_KNEE_CH, 0);
+  /* Auto-start walking on power-on */
+  Gait_Start();
 
-    Leg_SetHipKnee(&pca, HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG);
-    HAL_Delay(START_HOLD_MS);
+  UART_Sendf("=== CAT ROBOT READY — WALKING ===\r\n");
+  UART_Sendf("Cmds: GO FWD BACK LEFT RIGHT PIVOT_LEFT PIVOT_RIGHT STOP\r\n");
+  UART_Sendf("Touch zones: HEAD CHIN BELLY BACK TAIL PAW_LEFT PAW_RIGHT\r\n");
 
-    HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);
-    HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, WAKEUP_INTERVAL_SEC, RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
   /* USER CODE END 2 */
 
-  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t last_tick = HAL_GetTick();
 
   while (1)
   {
     /* USER CODE END WHILE */
-	    MX_USB_HOST_Process();
-	    BMI323_UpdateOdometry(&imu);
-	    HAL_Delay(10);
+    MX_USB_HOST_Process();
 
-	    static uint32_t last_send_ms = 0;
-	    uint32_t send_now = HAL_GetTick();
-
-	    if ((uint32_t)(send_now - last_send_ms) >= 50) {
-	        last_send_ms = send_now;
-
-	        BMI323_Sample_t s;
-	        if (BMI323_ReadSample(&imu, &s) == HAL_OK) {
-	            JL_SendIMU(&jl, &s);
-	        }
-	    }
-
-	    if (g_jl_low_power_event) {
-	        g_jl_low_power_event = 0;
-
-	        const char msg[] = "received low power\n";
-	        HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-	        if (g_jl_low_power_level >= 1) {
-	            low_power_mode = 1;
-
-	            PCA9685_SetServoPulseUs(&pca, 0, (HIP_MIN_US + HIP_MAX_US) * 0.5f);
-	            PCA9685_SetServoPulseUs(&pca, 2, (KNEE_MIN_US + KNEE_MAX_US) * 0.5f);
-
-	            (void)PCA9685_SetChannelFullOff(&pca, SERVO_HIP_CH,  1);
-	            (void)PCA9685_SetChannelFullOff(&pca, SERVO_KNEE_CH, 1);
-	            (void)PCA9685_SetChannelFullOff(&pca, SERVO_EXT_CH,  1);
-	        } else {
-	            low_power_mode = 0;
-
-	            (void)PCA9685_SetChannelFullOff(&pca, SERVO_HIP_CH,  0);
-	            (void)PCA9685_SetChannelFullOff(&pca, SERVO_KNEE_CH, 0);
-	            (void)PCA9685_SetChannelFullOff(&pca, SERVO_EXT_CH,  0);
-
-	            Leg_SetHipKnee(&pca, HIP_NEUTRAL_DEG, KNEE_NEUTRAL_DEG);
-	            Walking_Reset();
-	        }
-	    }
-
-	    if (g_jl_servo_event) {
-	        g_jl_servo_event = 0;
-
-	        PCA9685_SetServoPulseUs(&pca, g_jl_servo_ch, (float)g_jl_servo_us);
-	    }
-
-	    if (low_power_mode) {
-	        EnterSleepUntilRTC();
-	        continue;
-	    }
-
-	    GPIO_PinState state;
-		uint32_t now = HAL_GetTick();
-
-		state = GPIO_PIN_RESET;
-		if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN0, &state) == HAL_OK) {
-			uint8_t touch = (state == GPIO_PIN_SET);
-			if (touch && !last_touch_gpa0) {
-				gait_toggle = gait_toggle ? 0 : 1;
-				if (gait_toggle) {
-					const char msg[] = "Cat step ON\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				} else {
-					const char msg[] = "Cat step OFF\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				}
-			}
-			last_touch_gpa0 = touch;
-		}
-
-		state = GPIO_PIN_RESET;
-		if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN1, &state) == HAL_OK) {
-			uint8_t touch = (state == GPIO_PIN_SET);
-			gait_hold = touch;
-			if (touch && !last_touch_gpa1) {
-				const char msg[] = "Cat step HOLD\n";
-				HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-			} else if (!touch && last_touch_gpa1) {
-				const char msg[] = "Cat step RELEASE\n";
-				HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-			}
-			last_touch_gpa1 = touch;
-		} else {
-			gait_hold = 0;
-		}
-
-		state = GPIO_PIN_RESET;
-		if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN2, &state) == HAL_OK) {
-			uint8_t touch = (state == GPIO_PIN_SET);
-			if (touch && !last_touch_gpa2) {
-				press_start_gpa2 = now;
-			} else if (!touch && last_touch_gpa2) {
-				uint32_t duration = now - press_start_gpa2;
-				if (duration >= touch_time) {
-					const char msg[] = "Head LONG HOLD\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				} else {
-					const char msg[] = "Head\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				}
-			}
-			last_touch_gpa2 = touch;
-		}
-
-		state = GPIO_PIN_RESET;
-		if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN3, &state) == HAL_OK) {
-			uint8_t touch = (state == GPIO_PIN_SET);
-			if (touch && !last_touch_gpa3) {
-				press_start_gpa3 = now;
-			} else if (!touch && last_touch_gpa3) {
-				uint32_t duration = now - press_start_gpa3;
-				if (duration >= touch_time) {
-					const char msg[] = "Chin LONG HOLD\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				} else {
-					const char msg[] = "Chin\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				}
-			}
-			last_touch_gpa3 = touch;
-		}
-
-		state = GPIO_PIN_RESET;
-		if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN4, &state) == HAL_OK) {
-			uint8_t touch = (state == GPIO_PIN_SET);
-			if (touch && !last_touch_gpa4) {
-				press_start_gpa4 = now;
-			} else if (!touch && last_touch_gpa4) {
-				uint32_t duration = now - press_start_gpa4;
-				if (duration >= touch_time) {
-					const char msg[] = "Back LONG HOLD\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				} else {
-					const char msg[] = "Back\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				}
-			}
-			last_touch_gpa4 = touch;
-		}
-
-		state = GPIO_PIN_RESET;
-		if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN5, &state) == HAL_OK) {
-			uint8_t touch = (state == GPIO_PIN_SET);
-			if (touch && !last_touch_gpa5) {
-				press_start_gpa5 = now;
-			} else if (!touch && last_touch_gpa5) {
-				uint32_t duration = now - press_start_gpa5;
-				if (duration >= touch_time) {
-					const char msg[] = "Belly LONG HOLD\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				} else {
-					const char msg[] = "Belly\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				}
-			}
-			last_touch_gpa5 = touch;
-		}
-
-		state = GPIO_PIN_RESET;
-		if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN6, &state) == HAL_OK) {
-			uint8_t touch = (state == GPIO_PIN_SET);
-			if (touch && !last_touch_gpa6) {
-				press_start_gpa6 = now;
-			} else if (!touch && last_touch_gpa6) {
-				uint32_t duration = now - press_start_gpa6;
-				if (duration >= touch_time) {
-					const char msg[] = "Tail LONG HOLD\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				} else {
-					const char msg[] = "Tail\n";
-					HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-				}
-			}
-			last_touch_gpa6 = touch;
-		}
-	    state = GPIO_PIN_RESET;
-	    if (MCP23017_ReadPin(&mcp, MCP_PORTA, MCP_PIN7, &state) == HAL_OK) {
-	        uint8_t touch = (state == GPIO_PIN_SET);
-	        if (touch && !last_touch_gpa7) {
-	            const char msg[] = "PA7\n";
-	            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-	        }
-	        last_touch_gpa7 = touch;
-	    }
-	    state = GPIO_PIN_RESET;
-	    if (MCP23017_ReadPin(&mcp, MCP_PORTB, MCP_PIN0, &state) == HAL_OK) {
-	        uint8_t touch = (state == GPIO_PIN_SET);
-	        if (touch && !last_touch_gpb0) {
-	            const char msg[] = "PB0\n";
-	            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-	        }
-	        last_touch_gpb0 = touch;
-	    }
-	    state = GPIO_PIN_RESET;
-	    if (MCP23017_ReadPin(&mcp, MCP_PORTB, MCP_PIN1, &state) == HAL_OK) {
-	        uint8_t touch = (state == GPIO_PIN_SET);
-	        if (touch && !last_touch_gpb1) {
-	            const char msg[] = "PB1\n";
-	            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-	        }
-	        last_touch_gpb1 = touch;
-	    }
-	    state = GPIO_PIN_RESET;
-	    if (MCP23017_ReadPin(&mcp, MCP_PORTB, MCP_PIN2, &state) == HAL_OK) {
-	        uint8_t touch = (state == GPIO_PIN_SET);
-	        if (touch && !last_touch_gpb2) {
-	            const char msg[] = "PB2\n";
-	            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-	        }
-	        last_touch_gpb2 = touch;
-	    }
-	    state = GPIO_PIN_RESET;
-	    if (MCP23017_ReadPin(&mcp, MCP_PORTB, MCP_PIN3, &state) == HAL_OK) {
-	        uint8_t touch = (state == GPIO_PIN_SET);
-	        if (touch && !last_touch_gpb3) {
-	            const char msg[] = "PB3\n";
-	            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-	        }
-	        last_touch_gpb3 = touch;
-	    }
     /* USER CODE BEGIN 3 */
-	    uint8_t gait_run = (gait_toggle || gait_hold) ? 1 : 0;
-	    if (gait_run && !gait_run_prev) {
-	        Walking_Reset();
-	    }
-	    gait_run_prev = gait_run;
 
-	    if (gait_run) {
-	        Walking_Task(&pca, STEP_PERIOD_MS);
-	    }
+    /* --- Drain TX ring buffer (non-blocking) --- */
+    UART_TxService();
+
+    /* --- Motion commands from Jetson --- */
+    Handle_UART();
+
+    /* --- Gait tick (rate-limited) --- */
+    uint32_t now = HAL_GetTick();
+    uint32_t dt  = now - last_tick;
+    if (dt >= CONTROL_DT_MS) {
+      last_tick = now;
+      Gait_Tick((float)dt);
+    }
+
+    /* --- Touch sensor state machine --- */
+    Touch_Tick();
+
+    /* --- IMU stream to Jetson (skipped if BMI323 not present) --- */
+    if (g_imu_ok) IMU_Tick();
+
+    /* USER CODE END 3 */
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -575,236 +830,170 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   __HAL_RCC_PWR_CLK_ENABLE();
   __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 8;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 7;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM       = 8;
+  RCC_OscInitStruct.PLL.PLLN       = 336;
+  RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ       = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                   | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief RTC Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_RTC_Init(void)
-{
-  /* NOTE: This is a minimal RTC init. If you already configured RTC in CubeMX,
-     replace this function with the CubeMX-generated one. */
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
-
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI;
-  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_RTC;
-  PeriphClkInitStruct.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
-  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  __HAL_RCC_RTC_ENABLE();
-
-  hrtc.Instance = RTC;
-  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
-  hrtc.Init.AsynchPrediv = 127;
-  hrtc.Init.SynchPrediv = 255;
-  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
-  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
-  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
-  if (HAL_RTC_Init(&hrtc) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) { Error_Handler(); }
 }
 
 /**
   * @brief I2C1 Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_I2C1_Init(void)
 {
-
   /* USER CODE BEGIN I2C1_Init 0 */
-
   /* USER CODE END I2C1_Init 0 */
-
   /* USER CODE BEGIN I2C1_Init 1 */
-
   /* USER CODE END I2C1_Init 1 */
-  hi2c1.Instance = I2C1;
-  hi2c1.Init.ClockSpeed = 100000;
-  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c1.Init.OwnAddress1 = 0;
-  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+
+  hi2c1.Instance             = I2C1;
+  hi2c1.Init.ClockSpeed      = 100000;
+  hi2c1.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1     = 0;
+  hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.OwnAddress2     = 0;
   hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK) { Error_Handler(); }
+
   /* USER CODE BEGIN I2C1_Init 2 */
-
   /* USER CODE END I2C1_Init 2 */
-
 }
 
 /**
   * @brief I2C3 Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_I2C3_Init(void)
 {
-
   /* USER CODE BEGIN I2C3_Init 0 */
-
   /* USER CODE END I2C3_Init 0 */
-
   /* USER CODE BEGIN I2C3_Init 1 */
-
   /* USER CODE END I2C3_Init 1 */
-  hi2c3.Instance = I2C3;
-  hi2c3.Init.ClockSpeed = 100000;
-  hi2c3.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c3.Init.OwnAddress1 = 0;
-  hi2c3.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+
+  hi2c3.Instance             = I2C3;
+  hi2c3.Init.ClockSpeed      = 100000;
+  hi2c3.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1     = 0;
+  hi2c3.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
   hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c3.Init.OwnAddress2 = 0;
+  hi2c3.Init.OwnAddress2     = 0;
   hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c3.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-  if (HAL_I2C_Init(&hi2c3) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  hi2c3.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK) { Error_Handler(); }
+
   /* USER CODE BEGIN I2C3_Init 2 */
-
   /* USER CODE END I2C3_Init 2 */
+}
 
+/**
+  * @brief I2S3 Initialization Function
+  * @retval None
+  */
+static void MX_I2S3_Init(void)
+{
+  /* USER CODE BEGIN I2S3_Init 0 */
+  /* USER CODE END I2S3_Init 0 */
+  /* USER CODE BEGIN I2S3_Init 1 */
+  /* USER CODE END I2S3_Init 1 */
+
+  hi2s3.Instance            = SPI3;
+  hi2s3.Init.Mode           = I2S_MODE_MASTER_TX;
+  hi2s3.Init.Standard       = I2S_STANDARD_PHILIPS;
+  hi2s3.Init.DataFormat     = I2S_DATAFORMAT_16B;
+  hi2s3.Init.MCLKOutput     = I2S_MCLKOUTPUT_ENABLE;
+  hi2s3.Init.AudioFreq      = I2S_AUDIOFREQ_96K;
+  hi2s3.Init.CPOL           = I2S_CPOL_LOW;
+  hi2s3.Init.ClockSource    = I2S_CLOCK_PLL;
+  hi2s3.Init.FullDuplexMode = I2S_FULLDUPLEXMODE_DISABLE;
+  if (HAL_I2S_Init(&hi2s3) != HAL_OK) { Error_Handler(); }
+
+  /* USER CODE BEGIN I2S3_Init 2 */
+  /* USER CODE END I2S3_Init 2 */
 }
 
 /**
   * @brief SPI1 Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_SPI1_Init(void)
 {
-
   /* USER CODE BEGIN SPI1_Init 0 */
-
   /* USER CODE END SPI1_Init 0 */
-
   /* USER CODE BEGIN SPI1_Init 1 */
-
   /* USER CODE END SPI1_Init 1 */
-  /* SPI1 parameter configuration*/
-  hspi1.Instance = SPI1;
-  hspi1.Init.Mode = SPI_MODE_MASTER;
-  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
-  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
-  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
-  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
-  hspi1.Init.NSS = SPI_NSS_SOFT;
+
+  hspi1.Instance               = SPI1;
+  hspi1.Init.Mode              = SPI_MODE_MASTER;
+  hspi1.Init.Direction         = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize          = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity       = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase          = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS               = SPI_NSS_SOFT;
   hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
-  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
-  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
-  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
-  hspi1.Init.CRCPolynomial = 10;
-  if (HAL_SPI_Init(&hspi1) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  hspi1.Init.FirstBit          = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode            = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation    = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial     = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK) { Error_Handler(); }
+
   /* USER CODE BEGIN SPI1_Init 2 */
-
   /* USER CODE END SPI1_Init 2 */
-
 }
 
 /**
   * @brief USART2 Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_USART2_UART_Init(void)
 {
-
   /* USER CODE BEGIN USART2_Init 0 */
-
   /* USER CODE END USART2_Init 0 */
-
   /* USER CODE BEGIN USART2_Init 1 */
-
   /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+
+  huart2.Instance          = USART2;
+  huart2.Init.BaudRate     = 115200;
+  huart2.Init.WordLength   = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits     = UART_STOPBITS_1;
+  huart2.Init.Parity       = UART_PARITY_NONE;
+  huart2.Init.Mode         = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
+  if (HAL_UART_Init(&huart2) != HAL_OK) { Error_Handler(); }
+
   /* USER CODE BEGIN USART2_Init 2 */
-
   /* USER CODE END USART2_Init 2 */
-
 }
 
 /**
   * @brief GPIO Initialization Function
-  * @param None
   * @retval None
   */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
   /* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
@@ -812,150 +1001,96 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin|Audio_RST_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : CS_I2C_SPI_Pin */
-  GPIO_InitStruct.Pin = CS_I2C_SPI_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pin   = CS_I2C_SPI_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : OTG_FS_PowerSwitchOn_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_PowerSwitchOn_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pin   = OTG_FS_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PDM_OUT_Pin */
-  GPIO_InitStruct.Pin = PDM_OUT_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Pin       = PDM_OUT_Pin;
+  GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull      = GPIO_NOPULL;
+  GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
   HAL_GPIO_Init(PDM_OUT_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Pin  = B1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA4 */
-  GPIO_InitStruct.Pin = GPIO_PIN_4;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PB1 BOOT1_Pin */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|BOOT1_Pin;
+  GPIO_InitStruct.Pin  = BOOT1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+  HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : CLK_IN_Pin */
-  GPIO_InitStruct.Pin = CLK_IN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  /* PE7..PE13 — TTP223 touch sensors (HIGH = touched)
+     PE14, PE15 — spare GPIO inputs
+     PE8 uses PULLDOWN as originally generated (CHIN sensor still works:
+     TTP223 drives the line actively, pull-down just keeps it low when open) */
+  GPIO_InitStruct.Pin  = GPIO_PIN_7  | GPIO_PIN_9  | GPIO_PIN_10 | GPIO_PIN_11
+                        | GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin  = GPIO_PIN_8;   /* CHIN — keep original PULLDOWN */
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin       = CLK_IN_Pin;
+  GPIO_InitStruct.Mode      = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull      = GPIO_NOPULL;
+  GPIO_InitStruct.Speed     = GPIO_SPEED_FREQ_LOW;
   GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
   HAL_GPIO_Init(CLK_IN_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : LD4_Pin LD3_Pin LD5_Pin LD6_Pin
-                           Audio_RST_Pin */
-  GPIO_InitStruct.Pin = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin
-                          |Audio_RST_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pin   = LD4_Pin|LD3_Pin|LD5_Pin|LD6_Pin|Audio_RST_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : I2S3_MCK_Pin I2S3_SCK_Pin I2S3_SD_Pin */
-  GPIO_InitStruct.Pin = I2S3_MCK_Pin|I2S3_SCK_Pin|I2S3_SD_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  GPIO_InitStruct.Alternate = GPIO_AF6_SPI3;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : OTG_FS_OverCurrent_Pin */
-  GPIO_InitStruct.Pin = OTG_FS_OverCurrent_Pin;
+  GPIO_InitStruct.Pin  = OTG_FS_OverCurrent_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : MEMS_INT2_Pin */
-  GPIO_InitStruct.Pin = MEMS_INT2_Pin;
+  GPIO_InitStruct.Pin  = MEMS_INT2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART2) {
-    JL_OnUartRxCplt(&jl);
-  }
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART2) {
-    HAL_UART_Receive_IT(huart, &jl.rx_byte, 1);
-  }
-}
-
-void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc)
-{
-  (void)hrtc;
-}
 /* USER CODE END 4 */
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
-  while (1)
-  {
-  }
+  while (1) {}
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  * where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
