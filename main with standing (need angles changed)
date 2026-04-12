@@ -124,9 +124,13 @@ typedef struct {
 
 #define CONTROL_DT_MS      15U
 #define STEP_PERIOD_MS     1600U
-#define START_HOLD_MS      180000U  /* 3 minutes before auto-walk */
-#define GAIT_RAMP_MS       2000U
+#define START_HOLD_MS      600000U
 #define STAND_RISE_MS      2000U
+#define STAND_INIT_DEG     40.0f
+#define STAND_KNEE_DEG     80.0f
+#define STAND_INIT_DEG_R   110.0f
+#define STAND_KNEE_DEG_R   145.0f
+#define GAIT_RAMP_MS       2000U
 #define PAIR_DELAY_PHASE   0.50f
 #define STANCE_END_PHASE   0.62f
 #define HIP_SWING_AMP      26.0f
@@ -238,7 +242,7 @@ static void  gait_compute_leg(float phase, float hip_n, float knee_n,
                                float dir, float amp,
                                float *hip_out, float *knee_out);
 static void  Gait_Tick(float dt_ms);
-static void  Set_To_Stand(void);
+static void  Go_To_Neutral(void);
 static void  Initial_Stand_Position(void);
 static void  Handle_UART(void);
 
@@ -513,79 +517,50 @@ static void Gait_Tick(float dt_ms)
 
   write_servo(FL_HIP_CH,  apply_inv(fl_hip,  0), HIP_MIN_US,  HIP_MAX_US);
   write_servo(FL_KNEE_CH, apply_inv(fl_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(BL_HIP_CH,  apply_inv(bl_hip,  1), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_HIP_CH,  apply_inv(bl_hip,  0), HIP_MIN_US,  HIP_MAX_US);
   write_servo(BL_KNEE_CH, apply_inv(bl_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(FR_HIP_CH,  apply_inv(fr_hip,  0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(FR_KNEE_CH, apply_inv(fr_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(BR_HIP_CH,  apply_inv(br_hip,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(fr_hip,  1), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(fr_knee, 1), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(br_hip,  1), HIP_MIN_US,  HIP_MAX_US);
   write_servo(BR_KNEE_CH, apply_inv(br_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
 }
 
-static void Set_To_Stand(void)
+static void Go_To_Neutral(void)
 {
-  (void)PCA9685_SetChannelFullOff(&pca, FL_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, FL_KNEE_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BL_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BL_KNEE_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, FR_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, FR_KNEE_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BR_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BR_KNEE_CH, 0);
-
   write_servo(FL_HIP_CH,  apply_inv(FL_HIP_NEUTRAL  + FL_HIP_TRIM,  0), HIP_MIN_US,  HIP_MAX_US);
   write_servo(FL_KNEE_CH, apply_inv(FL_KNEE_NEUTRAL + FL_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(BL_HIP_CH,  apply_inv(BL_HIP_NEUTRAL  + BL_HIP_TRIM,  1), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_HIP_CH,  apply_inv(BL_HIP_NEUTRAL  + BL_HIP_TRIM,  0), HIP_MIN_US,  HIP_MAX_US);
   write_servo(BL_KNEE_CH, apply_inv(BL_KNEE_NEUTRAL + BL_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(FR_HIP_CH,  apply_inv(FR_HIP_NEUTRAL  + FR_HIP_TRIM,  0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(FR_KNEE_CH, apply_inv(FR_KNEE_NEUTRAL + FR_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(BR_HIP_CH,  apply_inv(BR_HIP_NEUTRAL  + BR_HIP_TRIM,  0), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(FR_HIP_NEUTRAL  + FR_HIP_TRIM,  1), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(FR_KNEE_NEUTRAL + FR_KNEE_TRIM, 1), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(BR_HIP_NEUTRAL  + BR_HIP_TRIM,  1), HIP_MIN_US,  HIP_MAX_US);
   write_servo(BR_KNEE_CH, apply_inv(BR_KNEE_NEUTRAL + BR_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
 }
 
-/* Smooth stand-up on power-on.
- *   1. 200 ms with servos unpowered so legs settle under gravity.
- *   2. STAND_RISE_MS sweep: knees lower from neutral+40° to their stance
- *      position, hips sweep forward 20° then return to neutral.
- *      BL hip is inverted (inv=1), matching the rest of the gait code. */
 static void Initial_Stand_Position(void)
 {
-  /* Re-assert extension channels FULL OFF in case PCA9685 lost state at power-up */
-  disable_extensions();
-
-  /* 200 ms unpowered — legs settle naturally under gravity */
   { uint32_t t = HAL_GetTick();
     while ((uint32_t)(HAL_GetTick() - t) < 200U) UART_TxService(); }
-
-  float fl_tgt = FL_KNEE_NEUTRAL + FL_KNEE_TRIM + KNEE_STANCE_BEND;
-  float fr_tgt = FR_KNEE_NEUTRAL + FR_KNEE_TRIM + KNEE_STANCE_BEND;
-  float bl_tgt = BL_KNEE_NEUTRAL + BL_KNEE_TRIM + KNEE_STANCE_BEND;
-  float br_tgt = BR_KNEE_NEUTRAL + BR_KNEE_TRIM + KNEE_STANCE_BEND;
-
-  (void)PCA9685_SetChannelFullOff(&pca, FL_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, FL_KNEE_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BL_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BL_KNEE_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, FR_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, FR_KNEE_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BR_HIP_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, BR_KNEE_CH, 0);
 
   { uint32_t t = HAL_GetTick();
     while ((uint32_t)(HAL_GetTick() - t) < STAND_RISE_MS) {
       UART_TxService();
-      float s       = smoothstep(clampf((float)(HAL_GetTick() - t) / (float)STAND_RISE_MS, 0.0f, 1.0f));
-      float off     = 40.0f * (1.0f - s);
-      float s_hip   = smoothstep(clampf(s * 2.0f, 0.0f, 1.0f));
-      float hip_off = 20.0f * (1.0f - s_hip);
+      float s = smoothstep(clampf((float)(HAL_GetTick() - t) / (float)STAND_RISE_MS, 0.0f, 1.0f));
 
-      write_servo(FL_KNEE_CH, apply_inv(fl_tgt + off, 0), KNEE_MIN_US, KNEE_MAX_US);
-      write_servo(FR_KNEE_CH, apply_inv(fr_tgt + off, 0), KNEE_MIN_US, KNEE_MAX_US);
-      write_servo(BL_KNEE_CH, apply_inv(bl_tgt + off, 0), KNEE_MIN_US, KNEE_MAX_US);
-      write_servo(BR_KNEE_CH, apply_inv(br_tgt + off, 0), KNEE_MIN_US, KNEE_MAX_US);
-      write_servo(FL_HIP_CH,  apply_inv(FL_HIP_NEUTRAL + FL_HIP_TRIM - hip_off, 0), HIP_MIN_US, HIP_MAX_US);
-      write_servo(FR_HIP_CH,  apply_inv(FR_HIP_NEUTRAL + FR_HIP_TRIM - hip_off, 0), HIP_MIN_US, HIP_MAX_US);
-      write_servo(BL_HIP_CH,  apply_inv(BL_HIP_NEUTRAL + BL_HIP_TRIM + hip_off, 1), HIP_MIN_US, HIP_MAX_US);
-      write_servo(BR_HIP_CH,  apply_inv(BR_HIP_NEUTRAL + BR_HIP_TRIM - hip_off, 0), HIP_MIN_US, HIP_MAX_US);
+      float fr_target = FR_KNEE_NEUTRAL + FR_KNEE_TRIM + KNEE_STANCE_BEND;
+      float fl_target = FL_KNEE_NEUTRAL + FL_KNEE_TRIM + KNEE_STANCE_BEND;
+      float br_target = BR_KNEE_NEUTRAL + BR_KNEE_TRIM + KNEE_STANCE_BEND;
+      float bl_target = BL_KNEE_NEUTRAL + BL_KNEE_TRIM + KNEE_STANCE_BEND;
+
+      float fr_k = STAND_INIT_DEG + s * (fr_target - STAND_INIT_DEG);
+      float fl_k = STAND_INIT_DEG + s * (fl_target - STAND_INIT_DEG);
+      float br_k = STAND_INIT_DEG + s * (br_target - STAND_INIT_DEG);
+      float bl_k = STAND_INIT_DEG + s * (bl_target - STAND_INIT_DEG);
+
+      write_servo(FR_KNEE_CH, apply_inv(fr_k, 1), KNEE_MIN_US, KNEE_MAX_US);
+      write_servo(FL_KNEE_CH, apply_inv(fl_k, 0), KNEE_MIN_US, KNEE_MAX_US);
+      write_servo(BR_KNEE_CH, apply_inv(br_k, 0), KNEE_MIN_US, KNEE_MAX_US);
+      write_servo(BL_KNEE_CH, apply_inv(bl_k, 0), KNEE_MIN_US, KNEE_MAX_US);
     }
   }
 }
@@ -635,7 +610,7 @@ static void Handle_UART(void)
     gait.yaw           = 0.0f;
     gait.ramp_start_ms = 0;
     gait.t0            = 0;
-    Set_To_Stand();
+    Go_To_Neutral();
     UART_Sendf("STOP ACK\r\n");
   } else {
     UART_Sendf("UNKNOWN: '%s'\r\n", rx);
@@ -798,25 +773,8 @@ int main(void)
 
   /* ---- Gait ---- */
   Gait_Init();
-  Set_To_Stand();
+  Initial_Stand_Position();
 
-  /* ---- BL channel diagnostic ---- */
-  {
-    /* Flush TX ring so boot messages actually transmit before HAL_Delay */
-    uint32_t t0 = HAL_GetTick();
-    while ((uint32_t)(HAL_GetTick() - t0) < 10U) UART_TxService();
-
-    HAL_StatusTypeDef bl_h = PCA9685_SetServoPulseUs(&pca, BL_HIP_CH,  1500U);
-    HAL_StatusTypeDef bl_k = PCA9685_SetServoPulseUs(&pca, BL_KNEE_CH, 1500U);
-    UART_Sendf("BL ch%u hip=%s ch%u knee=%s\r\n",
-               (unsigned)BL_HIP_CH,  bl_h == HAL_OK ? "OK" : "FAIL",
-               (unsigned)BL_KNEE_CH, bl_k == HAL_OK ? "OK" : "FAIL");
-    /* Hold 1500us (midpoint) for 800ms so you can see if BL servos respond */
-    t0 = HAL_GetTick();
-    while ((uint32_t)(HAL_GetTick() - t0) < 800U) UART_TxService();
-  }
-
-  UART_Sendf("At stand. Holding %ums...\r\n", (unsigned)START_HOLD_MS);
   { uint32_t t = HAL_GetTick();
     while ((uint32_t)(HAL_GetTick() - t) < START_HOLD_MS) UART_TxService(); }
 
