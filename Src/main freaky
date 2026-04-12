@@ -1,0 +1,629 @@
+#include "main.h"
+#include "pca9685.h"
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
+
+#define PCA9685_ADDR_7BIT   0x40
+
+#define FR_HIP_CH    0
+#define FR_KNEE_CH   2
+#define FR_EXT_CH    1
+
+#define FL_HIP_CH    4
+#define FL_KNEE_CH   6
+#define FL_EXT_CH    5
+
+#define BR_HIP_CH    8
+#define BR_KNEE_CH   9
+
+#define BL_HIP_CH    12
+#define BL_KNEE_CH   13
+
+#define HIP_MIN_US   900.0f
+#define HIP_MAX_US   2200.0f
+#define KNEE_MIN_US  900.0f
+#define KNEE_MAX_US  2200.0f
+#define EXT_MIN_US   900.0f
+#define EXT_MAX_US   2200.0f
+
+#define FR_HIP_NEUTRAL  60.0f //100
+#define FR_KNEE_NEUTRAL   0.0f
+#define FR_EXT_NEUTRAL    0.0f
+#define FL_HIP_NEUTRAL  130.0f //100
+#define FL_KNEE_NEUTRAL   0.0f
+#define FL_EXT_NEUTRAL    0.0f
+#define BR_HIP_NEUTRAL   130.0f //90
+#define BR_KNEE_NEUTRAL  90.0f
+#define BL_HIP_NEUTRAL   60.0f //90
+#define BL_KNEE_NEUTRAL  40.0f
+
+#define FR_HIP_TRIM   0.0f
+#define FR_KNEE_TRIM  0.0f
+#define FR_EXT_TRIM   0.0f
+#define FR_HIP_INV    0
+#define FR_KNEE_INV   0
+#define FR_EXT_INV    0
+
+#define FL_HIP_TRIM   0.0f
+#define FL_KNEE_TRIM  0.0f
+#define FL_EXT_TRIM   0.0f
+#define FL_HIP_INV    0
+#define FL_KNEE_INV   0
+#define FL_EXT_INV    0
+
+#define BR_HIP_TRIM   0.0f
+#define BR_KNEE_TRIM  0.0f
+#define BR_HIP_INV    1
+#define BR_KNEE_INV   0
+
+#define BL_HIP_TRIM   0.0f
+#define BL_KNEE_TRIM  0.0f
+#define BL_HIP_INV    1
+#define BL_KNEE_INV   0
+
+#define CONTROL_DT_MS      20U
+#define STEP_PERIOD_MS     1700U
+#define START_HOLD_MS      5000U
+#define GAIT_RAMP_MS       2200U
+#define DIAG_DELAY_PHASE   0.50f
+#define STANCE_END_PHASE   0.62f
+#define HIP_SWING_AMP      22.0f
+#define KNEE_BEND_AMP      48.0f
+#define KNEE_STANCE_BEND   12.0f
+
+/* Back-left tuning: remove most of the old damping so BL can keep up. */
+#define BL_HIP_AMP_SCALE    1.20f
+#define BL_KNEE_AMP_SCALE   1.22f
+#define BL_KNEE_STANCE_BOOST 4.0f
+#define BL_HIP_MIN_DEG      52.0f
+#define BL_HIP_MAX_DEG      128.0f
+#define BL_KNEE_MIN_DEG     18.0f
+#define BL_KNEE_MAX_DEG     118.0f
+
+#define TOKEN_GO    "GO"
+#define TOKEN_STOP  "STOP"
+#define TOKEN_FWD   "FWD"
+#define TOKEN_BACK  "BACK"
+#define TOKEN_LEFT  "LEFT"
+#define TOKEN_RIGHT "RIGHT"
+
+#define UART_BYTE_TIMEOUT_MS 0U
+#define UART_LINE_MAX        32
+#define UART_TX_BUF_SIZE     256U
+#define SERVO_FAULT_MAX      5U
+
+typedef struct {
+  int      running;
+  int      dir;
+  float    yaw;
+  uint32_t ramp_start_ms;
+  uint32_t t0;
+} GaitState;
+
+I2C_HandleTypeDef hi2c3;
+UART_HandleTypeDef huart2;
+PCA9685_Handle_t pca;
+GaitState gait;
+
+static uint8_t  g_servo_faults = 0;
+static uint8_t  uart_tx_buf[UART_TX_BUF_SIZE];
+static uint16_t uart_tx_head = 0;
+static uint16_t uart_tx_tail = 0;
+
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_I2C3_Init(void);
+static void MX_USART2_UART_Init(void);
+
+static float clampf(float v, float lo, float hi);
+static float smoothstep(float x);
+static float apply_inv(float deg, int inv);
+static float angle_to_us(float deg, float mn, float mx);
+static void  write_servo(uint8_t ch, float deg, float mn, float mx);
+static void  all_full_off(void);
+static void  set_extensions_neutral(void);
+static void  enable_hip_knee_channels(void);
+static void  enable_extension_channels(void);
+static void  enable_all_servo_channels(void);
+
+static void  UART_Sendf(const char *fmt, ...);
+static void  UART_TxService(void);
+static int   UART_TryReadLine(char out[UART_LINE_MAX]);
+static void  str_to_upper(char *s);
+
+static void  Gait_Init(void);
+static void  Gait_Start(void);
+static void  Gait_Stop(void);
+static void  gait_compute_leg(float phase, float hip_n, float knee_n,
+                              float dir, float amp,
+                              float *hip_out, float *knee_out);
+static void  Gait_Tick(float dt_ms);
+static void  Go_To_Neutral(void);
+static void  Handle_UART(void);
+
+static float clampf(float v, float lo, float hi)
+{ return (v < lo) ? lo : (v > hi) ? hi : v; }
+
+static float smoothstep(float x)
+{ x = clampf(x, 0.0f, 1.0f); return x * x * (3.0f - 2.0f * x); }
+
+static float apply_inv(float deg, int inv)
+{ return inv ? (180.0f - deg) : deg; }
+
+static float angle_to_us(float deg, float mn, float mx)
+{ deg = clampf(deg, 0.0f, 180.0f); return mn + (deg / 180.0f) * (mx - mn); }
+
+static void write_servo(uint8_t ch, float deg, float mn, float mx)
+{
+  if (PCA9685_SetServoPulseUs(&pca, ch, (uint16_t)angle_to_us(deg, mn, mx)) != HAL_OK) {
+    if (++g_servo_faults >= SERVO_FAULT_MAX) {
+      gait.running = 0;
+      UART_Sendf("SERVO FAULT ch%u: gait stopped\r\n", (unsigned)ch);
+    }
+  } else {
+    g_servo_faults = 0;
+  }
+}
+
+static void all_full_off(void)
+{
+  uint8_t chs[] = { FR_HIP_CH, FR_KNEE_CH, FR_EXT_CH,
+                    FL_HIP_CH, FL_KNEE_CH, FL_EXT_CH,
+                    BR_HIP_CH, BR_KNEE_CH,
+                    BL_HIP_CH, BL_KNEE_CH };
+  for (int i = 0; i < (int)(sizeof(chs) / sizeof(chs[0])); i++) {
+    (void)PCA9685_SetChannelFullOff(&pca, chs[i], 1);
+  }
+}
+
+static void enable_extension_channels(void)
+{
+  (void)PCA9685_SetChannelFullOff(&pca, FR_EXT_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, FL_EXT_CH, 0);
+}
+
+static void set_extensions_neutral(void)
+{
+  /* Front extension calibration: FR holds near 5 deg, FL needs 90 deg on this robot. */
+  enable_extension_channels();
+  write_servo(FR_EXT_CH, apply_inv(FR_EXT_NEUTRAL + FR_EXT_TRIM, FR_EXT_INV), EXT_MIN_US, EXT_MAX_US);
+  write_servo(FL_EXT_CH, apply_inv(FL_EXT_NEUTRAL + FL_EXT_TRIM, FL_EXT_INV), EXT_MIN_US, EXT_MAX_US);
+}
+
+static void enable_hip_knee_channels(void)
+{
+  (void)PCA9685_SetChannelFullOff(&pca, FR_HIP_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, FR_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, FL_HIP_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, FL_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, BR_HIP_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, BR_KNEE_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, BL_HIP_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, BL_KNEE_CH, 0);
+}
+
+static void enable_all_servo_channels(void)
+{
+  enable_hip_knee_channels();
+  enable_extension_channels();
+}
+
+static void UART_Sendf(const char *fmt, ...)
+{
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (len <= 0) return;
+  if (len > (int)(sizeof(buf) - 1)) len = (int)(sizeof(buf) - 1);
+
+  for (int i = 0; i < len; i++) {
+    uint16_t next = (uint16_t)((uart_tx_head + 1U) % UART_TX_BUF_SIZE);
+    if (next != uart_tx_tail) {
+      uart_tx_buf[uart_tx_head] = (uint8_t)buf[i];
+      uart_tx_head = next;
+    }
+  }
+}
+
+static void UART_TxService(void)
+{
+  while (uart_tx_head != uart_tx_tail && __HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE)) {
+    huart2.Instance->DR = uart_tx_buf[uart_tx_tail];
+    uart_tx_tail = (uint16_t)((uart_tx_tail + 1U) % UART_TX_BUF_SIZE);
+  }
+}
+
+static int UART_TryReadLine(char out[UART_LINE_MAX])
+{
+  static char line[UART_LINE_MAX];
+  static uint8_t idx = 0;
+  uint8_t b = 0;
+
+  if (HAL_UART_Receive(&huart2, &b, 1, UART_BYTE_TIMEOUT_MS) != HAL_OK) return 0;
+  if (b == '\r') return 0;
+
+  if (b == '\n') {
+    line[idx] = '\0';
+    strncpy(out, line, UART_LINE_MAX);
+    out[UART_LINE_MAX - 1] = '\0';
+    idx = 0;
+    return 1;
+  }
+
+  if (idx < UART_LINE_MAX - 1) line[idx++] = (char)b;
+  else idx = 0;
+  return 0;
+}
+
+static void str_to_upper(char *s)
+{
+  while (*s) {
+    *s = (char)toupper((unsigned char)*s);
+    s++;
+  }
+}
+
+static void Gait_Init(void)
+{
+  gait.running = 0;
+  gait.dir = +1;
+  gait.yaw = 0.0f;
+  gait.ramp_start_ms = 0;
+  gait.t0 = 0;
+}
+
+static void gait_compute_leg(float phase, float hip_n, float knee_n,
+                             float dir, float amp,
+                             float *hip_out, float *knee_out)
+{
+  float hip, knee;
+
+  if (phase < STANCE_END_PHASE) {
+    float u = smoothstep(phase / STANCE_END_PHASE);
+    hip  = hip_n - dir * amp * (2.0f * u - 1.0f);
+    knee = knee_n + KNEE_STANCE_BEND;
+  } else {
+    float u    = (phase - STANCE_END_PHASE) / (1.0f - STANCE_END_PHASE);
+    float s    = smoothstep(u);
+    float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
+    hip  = hip_n + dir * amp * (2.0f * s - 1.0f);
+    knee = knee_n + KNEE_BEND_AMP * lift;
+  }
+
+  *hip_out  = clampf(hip, 0.0f, 180.0f);
+  *knee_out = clampf(knee, 0.0f, 180.0f);
+}
+
+static void Gait_Tick(float dt_ms)
+{
+  (void)dt_ms;
+  if (!gait.running) return;
+
+  uint32_t now = HAL_GetTick();
+  if (gait.t0 == 0U) gait.t0 = now;
+
+  float phase_a = (float)((now - gait.t0) % STEP_PERIOD_MS) / (float)STEP_PERIOD_MS;
+  float phase_b = phase_a + DIAG_DELAY_PHASE;
+  if (phase_b >= 1.0f) phase_b -= 1.0f;
+
+  float ramp = smoothstep(clampf((float)(now - gait.ramp_start_ms) / (float)GAIT_RAMP_MS,
+                                 0.0f, 1.0f));
+  float dir = (float)gait.dir;
+
+  float a_dir, b_dir, a_amp, b_amp;
+  if (dir == 0.0f) {
+    a_dir = gait.yaw;
+    b_dir = -gait.yaw;
+    a_amp = HIP_SWING_AMP;
+    b_amp = HIP_SWING_AMP;
+  } else {
+    a_amp = HIP_SWING_AMP * clampf(1.0f + gait.yaw, 0.0f, 2.0f);
+    b_amp = HIP_SWING_AMP * clampf(1.0f - gait.yaw, 0.0f, 2.0f);
+    a_dir = dir;
+    b_dir = dir;
+  }
+
+  float fr_hip, fr_knee, bl_hip, bl_knee;
+  float fl_hip, fl_knee, br_hip, br_knee;
+
+  /* True diagonal sync: FR+BL share phase_a, FL+BR share phase_b. */
+  gait_compute_leg(phase_a, FR_HIP_NEUTRAL + FR_HIP_TRIM, FR_KNEE_NEUTRAL + FR_KNEE_TRIM,
+                   a_dir, a_amp, &fr_hip, &fr_knee);
+  gait_compute_leg(phase_a, BL_HIP_NEUTRAL + BL_HIP_TRIM, BL_KNEE_NEUTRAL + BL_KNEE_TRIM,
+                   a_dir, a_amp * BL_HIP_AMP_SCALE, &bl_hip, &bl_knee);
+  gait_compute_leg(phase_b, FL_HIP_NEUTRAL + FL_HIP_TRIM, FL_KNEE_NEUTRAL + FL_KNEE_TRIM,
+                   b_dir, b_amp, &fl_hip, &fl_knee);
+  gait_compute_leg(phase_b, BR_HIP_NEUTRAL + BR_HIP_TRIM, BR_KNEE_NEUTRAL + BR_KNEE_TRIM,
+                   b_dir, b_amp, &br_hip, &br_knee);
+
+  /* Knee motion disabled: keep all knees locked at neutral during gait. */
+
+#define RAMP_VAL(val, n) ((n) + ramp * ((val) - (n)))
+  fr_hip  = RAMP_VAL(fr_hip,  FR_HIP_NEUTRAL + FR_HIP_TRIM);
+  bl_hip  = RAMP_VAL(bl_hip,  BL_HIP_NEUTRAL + BL_HIP_TRIM);
+  fl_hip  = RAMP_VAL(fl_hip,  FL_HIP_NEUTRAL + FL_HIP_TRIM);
+  br_hip  = RAMP_VAL(br_hip,  BR_HIP_NEUTRAL + BR_HIP_TRIM);
+#undef RAMP_VAL
+
+  fr_knee = FR_KNEE_NEUTRAL + FR_KNEE_TRIM;
+  fl_knee = FL_KNEE_NEUTRAL + FL_KNEE_TRIM;
+  br_knee = BR_KNEE_NEUTRAL + BR_KNEE_TRIM;
+  bl_knee = BL_KNEE_NEUTRAL + BL_KNEE_TRIM;
+
+  /* Still keep BL hip inside a safe window. */
+  bl_hip  = clampf(bl_hip,  BL_HIP_MIN_DEG,  BL_HIP_MAX_DEG);
+
+  /* Write the BL pair first so it gets updated earliest each control cycle. */
+  write_servo(BL_HIP_CH,  apply_inv(bl_hip, BL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_KNEE_CH, apply_inv(bl_knee, BL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(fr_hip, FR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(fr_knee, FR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(br_hip, BR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BR_KNEE_CH, apply_inv(br_knee, BR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FL_HIP_CH,  apply_inv(fl_hip, FL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FL_KNEE_CH, apply_inv(fl_knee, FL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+}
+
+static void Go_To_Neutral(void)
+{
+  set_extensions_neutral();
+  write_servo(BL_HIP_CH,  apply_inv(BL_HIP_NEUTRAL + BL_HIP_TRIM, BL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_KNEE_CH, apply_inv(BL_KNEE_NEUTRAL + BL_KNEE_TRIM, BL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(FR_HIP_NEUTRAL + FR_HIP_TRIM, FR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(FR_KNEE_NEUTRAL + FR_KNEE_TRIM, FR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(BR_HIP_NEUTRAL + BR_HIP_TRIM, BR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BR_KNEE_CH, apply_inv(BR_KNEE_NEUTRAL + BR_KNEE_TRIM, BR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FL_HIP_CH,  apply_inv(FL_HIP_NEUTRAL + FL_HIP_TRIM, FL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FL_KNEE_CH, apply_inv(FL_KNEE_NEUTRAL + FL_KNEE_TRIM, FL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+}
+
+static void Gait_Start(void)
+{
+  gait.running = 1;
+  gait.ramp_start_ms = HAL_GetTick();
+  gait.t0 = 0;
+}
+
+static void Gait_Stop(void)
+{
+  gait.running = 0;
+  gait.dir = +1;
+  gait.yaw = 0.0f;
+  gait.ramp_start_ms = 0;
+  gait.t0 = 0;
+  Go_To_Neutral();
+}
+
+static void Handle_UART(void)
+{
+  char rx[UART_LINE_MAX];
+  if (!UART_TryReadLine(rx)) return;
+  str_to_upper(rx);
+
+  if (strcmp(rx, TOKEN_GO) == 0 || strcmp(rx, TOKEN_FWD) == 0) {
+    gait.dir = +1;
+    gait.yaw = 0.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("FWD\r\n");
+  } else if (strcmp(rx, TOKEN_BACK) == 0) {
+    gait.dir = -1;
+    gait.yaw = 0.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("BACK\r\n");
+  } else if (strcmp(rx, TOKEN_LEFT) == 0) {
+    gait.yaw = -1.0f;
+    if (gait.dir == 0) gait.dir = +1;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("LEFT\r\n");
+  } else if (strcmp(rx, TOKEN_RIGHT) == 0) {
+    gait.yaw = +1.0f;
+    if (gait.dir == 0) gait.dir = +1;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("RIGHT\r\n");
+  } else if (strcmp(rx, "PIVOT_LEFT") == 0) {
+    gait.dir = 0;
+    gait.yaw = -1.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("PIVOT_LEFT\r\n");
+  } else if (strcmp(rx, "PIVOT_RIGHT") == 0) {
+    gait.dir = 0;
+    gait.yaw = +1.0f;
+    if (!gait.running) Gait_Start();
+    UART_Sendf("PIVOT_RIGHT\r\n");
+  } else if (strcmp(rx, TOKEN_STOP) == 0) {
+    Gait_Stop();
+    UART_Sendf("STOP ACK\r\n");
+  } else {
+    UART_Sendf("UNKNOWN: '%s'\r\n", rx);
+  }
+}
+
+int main(void)
+{
+  HAL_Init();
+  SystemClock_Config();
+
+  MX_GPIO_Init();
+  MX_I2C3_Init();
+  MX_USART2_UART_Init();
+
+  UART_Sendf("\r\nBOOT OK @115200\r\n");
+
+  if (HAL_I2C_IsDeviceReady(&hi2c3, (PCA9685_ADDR_7BIT << 1), 5, 200) != HAL_OK) {
+    UART_Sendf("ERROR: PCA9685 not found (I2C3 0x%02X)\r\n", PCA9685_ADDR_7BIT);
+    Error_Handler();
+  }
+  if (PCA9685_Init(&pca, &hi2c3, PCA9685_ADDR_7BIT, 50.0f) != HAL_OK) {
+    UART_Sendf("ERROR: PCA9685_Init failed\r\n");
+    Error_Handler();
+  }
+
+  all_full_off();
+  enable_all_servo_channels();
+  set_extensions_neutral();
+  UART_Sendf("PCA9685 OK\r\n");
+  UART_Sendf("Jitter fix applied: channels are enabled once, not re-toggled every control cycle.\r\n");
+  UART_Sendf("BL hip strengthened: more swing and wider allowed range.\r\n");
+  UART_Sendf("Knee motion disabled: all knees locked at neutral during walking.\r\n");
+
+  Gait_Init();
+  Go_To_Neutral();
+
+  UART_Sendf("At neutral. Holding %lu ms before walking...\r\n", (unsigned long)START_HOLD_MS);
+  UART_Sendf("Extensions locked at 0 deg during walk.\r\n");
+  UART_Sendf("Hip-only walk active. Knees stay at neutral; BR hip inverted so FL+BR match physically.\r\n");
+  {
+    uint32_t t = HAL_GetTick();
+    while ((uint32_t)(HAL_GetTick() - t) < START_HOLD_MS) {
+      UART_TxService();
+      Handle_UART();
+      if (gait.running) break;
+    }
+  }
+
+  if (!gait.running) {
+    Gait_Start();
+    UART_Sendf("AUTO WALK START\r\n");
+  }
+
+  UART_Sendf("Cmds: GO FWD BACK LEFT RIGHT PIVOT_LEFT PIVOT_RIGHT STOP\r\n");
+
+  uint32_t last_tick = HAL_GetTick();
+
+  while (1) {
+    UART_TxService();
+    Handle_UART();
+
+    uint32_t now = HAL_GetTick();
+    uint32_t dt  = now - last_tick;
+    if (dt >= CONTROL_DT_MS) {
+      last_tick = now;
+      Gait_Tick((float)dt);
+    }
+  }
+}
+
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState       = RCC_HSE_ON;
+  RCC_OscInitStruct.PLL.PLLState   = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM       = 8;
+  RCC_OscInitStruct.PLL.PLLN       = 336;
+  RCC_OscInitStruct.PLL.PLLP       = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ       = 7;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) { Error_Handler(); }
+
+  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
+                                     RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) { Error_Handler(); }
+}
+
+static void MX_I2C3_Init(void)
+{
+  hi2c3.Instance             = I2C3;
+  hi2c3.Init.ClockSpeed      = 100000;
+  hi2c3.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+  hi2c3.Init.OwnAddress1     = 0;
+  hi2c3.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+  hi2c3.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c3.Init.OwnAddress2     = 0;
+  hi2c3.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c3.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c3) != HAL_OK) { Error_Handler(); }
+}
+
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance          = USART2;
+  huart2.Init.BaudRate     = 115200;
+  huart2.Init.WordLength   = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits     = UART_STOPBITS_1;
+  huart2.Init.Parity       = UART_PARITY_NONE;
+  huart2.Init.Mode         = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl    = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK) { Error_Handler(); }
+}
+
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(CS_I2C_SPI_GPIO_Port, CS_I2C_SPI_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(OTG_FS_PowerSwitchOn_GPIO_Port, OTG_FS_PowerSwitchOn_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOD, LD4_Pin | LD3_Pin | LD5_Pin | LD6_Pin | Audio_RST_Pin, GPIO_PIN_RESET);
+
+  GPIO_InitStruct.Pin   = CS_I2C_SPI_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(CS_I2C_SPI_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin   = OTG_FS_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(OTG_FS_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin  = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin  = BOOT1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(BOOT1_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin   = LD4_Pin | LD3_Pin | LD5_Pin | LD6_Pin | Audio_RST_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin  = OTG_FS_OverCurrent_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(OTG_FS_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+  GPIO_InitStruct.Pin  = MEMS_INT2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_EVT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(MEMS_INT2_GPIO_Port, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+  __disable_irq();
+  while (1) {}
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  (void)file;
+  (void)line;
+}
+#endif
