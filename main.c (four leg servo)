@@ -25,11 +25,15 @@
 #define HIP_MAX_US   2200.0f
 #define KNEE_MIN_US  900.0f
 #define KNEE_MAX_US  2200.0f
+#define EXT_MIN_US   900.0f
+#define EXT_MAX_US   2200.0f
 
 #define FR_HIP_NEUTRAL  100.0f
 #define FR_KNEE_NEUTRAL   0.0f
+#define FR_EXT_NEUTRAL    0.0f
 #define FL_HIP_NEUTRAL  100.0f
 #define FL_KNEE_NEUTRAL   0.0f
+#define FL_EXT_NEUTRAL    0.0f
 #define BR_HIP_NEUTRAL   90.0f
 #define BR_KNEE_NEUTRAL  90.0f
 #define BL_HIP_NEUTRAL   90.0f
@@ -37,29 +41,44 @@
 
 #define FR_HIP_TRIM   0.0f
 #define FR_KNEE_TRIM  0.0f
+#define FR_EXT_TRIM   0.0f
+#define FR_HIP_INV    0
+#define FR_KNEE_INV   0
+#define FR_EXT_INV    0
+
 #define FL_HIP_TRIM   0.0f
 #define FL_KNEE_TRIM  0.0f
+#define FL_EXT_TRIM   0.0f
+#define FL_HIP_INV    0
+#define FL_KNEE_INV   0
+#define FL_EXT_INV    0
+
 #define BR_HIP_TRIM   0.0f
 #define BR_KNEE_TRIM  0.0f
+#define BR_HIP_INV    1
+#define BR_KNEE_INV   0
+
 #define BL_HIP_TRIM   0.0f
 #define BL_KNEE_TRIM  0.0f
+#define BL_HIP_INV    1
+#define BL_KNEE_INV   0
 
 #define CONTROL_DT_MS      20U
-#define STEP_PERIOD_MS     2200U
+#define STEP_PERIOD_MS     1700U
 #define START_HOLD_MS      5000U
 #define GAIT_RAMP_MS       2200U
-#define DIAG_DELAY_PHASE   1.00f
+#define DIAG_DELAY_PHASE   0.50f
 #define STANCE_END_PHASE   0.62f
 #define HIP_SWING_AMP      22.0f
 #define KNEE_BEND_AMP      48.0f
 #define KNEE_STANCE_BEND   12.0f
 
 /* Back-left tuning: remove most of the old damping so BL can keep up. */
-#define BL_HIP_AMP_SCALE    0.95f
+#define BL_HIP_AMP_SCALE    1.20f
 #define BL_KNEE_AMP_SCALE   1.22f
 #define BL_KNEE_STANCE_BOOST 4.0f
-#define BL_HIP_MIN_DEG      58.0f
-#define BL_HIP_MAX_DEG      122.0f
+#define BL_HIP_MIN_DEG      52.0f
+#define BL_HIP_MAX_DEG      128.0f
 #define BL_KNEE_MIN_DEG     18.0f
 #define BL_KNEE_MAX_DEG     118.0f
 
@@ -104,8 +123,10 @@ static float apply_inv(float deg, int inv);
 static float angle_to_us(float deg, float mn, float mx);
 static void  write_servo(uint8_t ch, float deg, float mn, float mx);
 static void  all_full_off(void);
-static void  disable_extensions(void);
+static void  set_extensions_neutral(void);
 static void  enable_hip_knee_channels(void);
+static void  enable_extension_channels(void);
+static void  enable_all_servo_channels(void);
 
 static void  UART_Sendf(const char *fmt, ...);
 static void  UART_TxService(void);
@@ -157,10 +178,18 @@ static void all_full_off(void)
   }
 }
 
-static void disable_extensions(void)
+static void enable_extension_channels(void)
 {
-  (void)PCA9685_SetChannelFullOff(&pca, FR_EXT_CH, 1);
-  (void)PCA9685_SetChannelFullOff(&pca, FL_EXT_CH, 1);
+  (void)PCA9685_SetChannelFullOff(&pca, FR_EXT_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, FL_EXT_CH, 0);
+}
+
+static void set_extensions_neutral(void)
+{
+  /* Front extension calibration: FR holds near 5 deg, FL needs 90 deg on this robot. */
+  enable_extension_channels();
+  write_servo(FR_EXT_CH, apply_inv(FR_EXT_NEUTRAL + FR_EXT_TRIM, FR_EXT_INV), EXT_MIN_US, EXT_MAX_US);
+  write_servo(FL_EXT_CH, apply_inv(FL_EXT_NEUTRAL + FL_EXT_TRIM, FL_EXT_INV), EXT_MIN_US, EXT_MAX_US);
 }
 
 static void enable_hip_knee_channels(void)
@@ -173,6 +202,12 @@ static void enable_hip_knee_channels(void)
   (void)PCA9685_SetChannelFullOff(&pca, BR_KNEE_CH, 0);
   (void)PCA9685_SetChannelFullOff(&pca, BL_HIP_CH, 0);
   (void)PCA9685_SetChannelFullOff(&pca, BL_KNEE_CH, 0);
+}
+
+static void enable_all_servo_channels(void)
+{
+  enable_hip_knee_channels();
+  enable_extension_channels();
 }
 
 static void UART_Sendf(const char *fmt, ...)
@@ -324,30 +359,28 @@ static void Gait_Tick(float dt_ms)
   bl_hip  = clampf(bl_hip,  BL_HIP_MIN_DEG,  BL_HIP_MAX_DEG);
   bl_knee = clampf(bl_knee, BL_KNEE_MIN_DEG, BL_KNEE_MAX_DEG);
 
-  enable_hip_knee_channels();
-
   /* Write the BL pair first so it gets updated earliest each control cycle. */
-  write_servo(BL_HIP_CH,  apply_inv(bl_hip, 1), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(BL_KNEE_CH, apply_inv(bl_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(FR_HIP_CH,  apply_inv(fr_hip, 0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(FR_KNEE_CH, apply_inv(fr_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(BR_HIP_CH,  apply_inv(br_hip, 0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(BR_KNEE_CH, apply_inv(br_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(FL_HIP_CH,  apply_inv(fl_hip, 0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(FL_KNEE_CH, apply_inv(fl_knee, 0), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BL_HIP_CH,  apply_inv(bl_hip, BL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_KNEE_CH, apply_inv(bl_knee, BL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(fr_hip, FR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(fr_knee, FR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(br_hip, BR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BR_KNEE_CH, apply_inv(br_knee, BR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FL_HIP_CH,  apply_inv(fl_hip, FL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FL_KNEE_CH, apply_inv(fl_knee, FL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
 }
 
 static void Go_To_Neutral(void)
 {
-  enable_hip_knee_channels();
-  write_servo(BL_HIP_CH,  apply_inv(BL_HIP_NEUTRAL + BL_HIP_TRIM, 1), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(BL_KNEE_CH, apply_inv(BL_KNEE_NEUTRAL + BL_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(FR_HIP_CH,  apply_inv(FR_HIP_NEUTRAL + FR_HIP_TRIM, 0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(FR_KNEE_CH, apply_inv(FR_KNEE_NEUTRAL + FR_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(BR_HIP_CH,  apply_inv(BR_HIP_NEUTRAL + BR_HIP_TRIM, 0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(BR_KNEE_CH, apply_inv(BR_KNEE_NEUTRAL + BR_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(FL_HIP_CH,  apply_inv(FL_HIP_NEUTRAL + FL_HIP_TRIM, 0), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(FL_KNEE_CH, apply_inv(FL_KNEE_NEUTRAL + FL_KNEE_TRIM, 0), KNEE_MIN_US, KNEE_MAX_US);
+  set_extensions_neutral();
+  write_servo(BL_HIP_CH,  apply_inv(BL_HIP_NEUTRAL + BL_HIP_TRIM, BL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_KNEE_CH, apply_inv(BL_KNEE_NEUTRAL + BL_KNEE_TRIM, BL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(FR_HIP_NEUTRAL + FR_HIP_TRIM, FR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(FR_KNEE_NEUTRAL + FR_KNEE_TRIM, FR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(BR_HIP_NEUTRAL + BR_HIP_TRIM, BR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BR_KNEE_CH, apply_inv(BR_KNEE_NEUTRAL + BR_KNEE_TRIM, BR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FL_HIP_CH,  apply_inv(FL_HIP_NEUTRAL + FL_HIP_TRIM, FL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FL_KNEE_CH, apply_inv(FL_KNEE_NEUTRAL + FL_KNEE_TRIM, FL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
 }
 
 static void Gait_Start(void)
@@ -431,16 +464,19 @@ int main(void)
     Error_Handler();
   }
 
-  disable_extensions();
   all_full_off();
-  enable_hip_knee_channels();
+  enable_all_servo_channels();
+  set_extensions_neutral();
   UART_Sendf("PCA9685 OK\r\n");
+  UART_Sendf("Jitter fix applied: channels are enabled once, not re-toggled every control cycle.\r\n");
+  UART_Sendf("BL hip strengthened: more swing and wider allowed range.\r\n");
 
   Gait_Init();
   Go_To_Neutral();
 
   UART_Sendf("At neutral. Holding %lu ms before walking...\r\n", (unsigned long)START_HOLD_MS);
-  UART_Sendf("Diag sync FR+BL / FL+BR. Opposite diagonal delayed by 1.00 cycle.\r\n");
+  UART_Sendf("Extensions locked at 0 deg during walk.\r\n");
+  UART_Sendf("Diag sync FR+BL / FL+BR. BR hip inverted so FL+BR match physically.\r\n");
   {
     uint32_t t = HAL_GetTick();
     while ((uint32_t)(HAL_GetTick() - t) < START_HOLD_MS) {
