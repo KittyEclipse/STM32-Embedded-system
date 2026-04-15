@@ -28,15 +28,15 @@
 #define EXT_MIN_US   900.0f
 #define EXT_MAX_US   2200.0f
 
-#define FR_HIP_NEUTRAL  100.0f
+#define FR_HIP_NEUTRAL  60.0f //100
 #define FR_KNEE_NEUTRAL   0.0f
 #define FR_EXT_NEUTRAL    0.0f
-#define FL_HIP_NEUTRAL  100.0f
+#define FL_HIP_NEUTRAL  130.0f //100
 #define FL_KNEE_NEUTRAL   0.0f
 #define FL_EXT_NEUTRAL    0.0f
-#define BR_HIP_NEUTRAL   90.0f
+#define BR_HIP_NEUTRAL   130.0f //90
 #define BR_KNEE_NEUTRAL  90.0f
-#define BL_HIP_NEUTRAL   90.0f
+#define BL_HIP_NEUTRAL   60.0f //90
 #define BL_KNEE_NEUTRAL  40.0f
 
 #define FR_HIP_TRIM   0.0f
@@ -340,24 +340,22 @@ static void Gait_Tick(float dt_ms)
   gait_compute_leg(phase_b, BR_HIP_NEUTRAL + BR_HIP_TRIM, BR_KNEE_NEUTRAL + BR_KNEE_TRIM,
                    b_dir, b_amp, &br_hip, &br_knee);
 
-  /* Give BL knee a bit more command range so it does not look weak. */
-  bl_knee = BL_KNEE_NEUTRAL + (bl_knee - BL_KNEE_NEUTRAL) * BL_KNEE_AMP_SCALE;
-  if (bl_knee > BL_KNEE_NEUTRAL) bl_knee += BL_KNEE_STANCE_BOOST;
+  /* Knee motion disabled: keep the current knee neutral positions during gait. */
 
 #define RAMP_VAL(val, n) ((n) + ramp * ((val) - (n)))
   fr_hip  = RAMP_VAL(fr_hip,  FR_HIP_NEUTRAL + FR_HIP_TRIM);
-  fr_knee = RAMP_VAL(fr_knee, FR_KNEE_NEUTRAL + FR_KNEE_TRIM);
   bl_hip  = RAMP_VAL(bl_hip,  BL_HIP_NEUTRAL + BL_HIP_TRIM);
-  bl_knee = RAMP_VAL(bl_knee, BL_KNEE_NEUTRAL + BL_KNEE_TRIM);
   fl_hip  = RAMP_VAL(fl_hip,  FL_HIP_NEUTRAL + FL_HIP_TRIM);
-  fl_knee = RAMP_VAL(fl_knee, FL_KNEE_NEUTRAL + FL_KNEE_TRIM);
   br_hip  = RAMP_VAL(br_hip,  BR_HIP_NEUTRAL + BR_HIP_TRIM);
-  br_knee = RAMP_VAL(br_knee, BR_KNEE_NEUTRAL + BR_KNEE_TRIM);
 #undef RAMP_VAL
 
-  /* Still keep BL inside a safe window, but much wider than before. */
+  fr_knee = FR_KNEE_NEUTRAL + FR_KNEE_TRIM;
+  fl_knee = FL_KNEE_NEUTRAL + FL_KNEE_TRIM;
+  br_knee = BR_KNEE_NEUTRAL + BR_KNEE_TRIM;
+  bl_knee = BL_KNEE_NEUTRAL + BL_KNEE_TRIM;
+
+  /* Still keep BL hip inside a safe window. */
   bl_hip  = clampf(bl_hip,  BL_HIP_MIN_DEG,  BL_HIP_MAX_DEG);
-  bl_knee = clampf(bl_knee, BL_KNEE_MIN_DEG, BL_KNEE_MAX_DEG);
 
   /* Write the BL pair first so it gets updated earliest each control cycle. */
   write_servo(BL_HIP_CH,  apply_inv(bl_hip, BL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
@@ -476,7 +474,7 @@ int main(void)
 
   UART_Sendf("At neutral. Holding %lu ms before walking...\r\n", (unsigned long)START_HOLD_MS);
   UART_Sendf("Extensions locked at 0 deg during walk.\r\n");
-  UART_Sendf("Diag sync FR+BL / FL+BR. BR hip inverted so FL+BR match physically.\r\n");
+  UART_Sendf("Diagonal alternation active: FL+BR and FR+BL are 180 deg out of phase.\r\n");
   {
     uint32_t t = HAL_GetTick();
     while ((uint32_t)(HAL_GetTick() - t) < START_HOLD_MS) {
