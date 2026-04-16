@@ -37,7 +37,7 @@ typedef struct {
 
 #define FR_HIP_CH    0
 #define FR_KNEE_CH   2
-#define FR_EXT_CH    1
+#define FR_EXT_CH    1 
 
 #define FL_HIP_CH    4
 #define FL_KNEE_CH   6
