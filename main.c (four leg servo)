@@ -29,13 +29,13 @@
 #define EXT_MAX_US   2200.0f
 
 #define FR_HIP_NEUTRAL  60.0f //100
-#define FR_KNEE_NEUTRAL   FL_KNEE_NEUTRAL // mirror front-left knee to front-right
+#define FR_KNEE_NEUTRAL   30.0f //180
 #define FR_EXT_NEUTRAL    0.0f
 #define FL_HIP_NEUTRAL  130.0f //100
 #define FL_KNEE_NEUTRAL  110.0f //0
 #define FL_EXT_NEUTRAL    0.0f
 #define BR_HIP_NEUTRAL   130.0f //90
-#define BR_KNEE_NEUTRAL  BL_KNEE_NEUTRAL // mirror back-left knee to back-right
+#define BR_KNEE_NEUTRAL  30.0f //180
 #define BL_HIP_NEUTRAL   60.0f //90
 #define BL_KNEE_NEUTRAL  100.0f //40
 
@@ -43,7 +43,7 @@
 #define FR_KNEE_TRIM  0.0f
 #define FR_EXT_TRIM   0.0f
 #define FR_HIP_INV    0
-#define FR_KNEE_INV   1
+#define FR_KNEE_INV   0
 #define FR_EXT_INV    0
 
 #define FL_HIP_TRIM   0.0f
@@ -56,7 +56,7 @@
 #define BR_HIP_TRIM   0.0f
 #define BR_KNEE_TRIM  0.0f
 #define BR_HIP_INV    1
-#define BR_KNEE_INV   1
+#define BR_KNEE_INV   0
 
 #define BL_HIP_TRIM   0.0f
 #define BL_KNEE_TRIM  0.0f
@@ -64,21 +64,27 @@
 #define BL_KNEE_INV   0
 
 #define CONTROL_DT_MS      20U
-#define STEP_PERIOD_MS     1700U
+#define LEG_MOVE_MS        900U
+#define LEG_WAIT_MS        0U
+#define STEP_PERIOD_MS     ((LEG_MOVE_MS + LEG_WAIT_MS) * 4U)
 #define START_HOLD_MS      5000U
 #define GAIT_RAMP_MS       2200U
-#define DIAG_DELAY_PHASE   0.0f
+#define DIAG_DELAY_PHASE   0.5f
 #define STANCE_END_PHASE   0.62f
-#define HIP_SWING_AMP      22.0f
+#define HIP_SWING_AMP      24.0f
+#define HIP_FORWARD_BIAS   31.0f
+#define HIP_BACKWARD_AMP   4.0f
 #define KNEE_BEND_AMP      48.0f
 #define KNEE_STANCE_BEND   12.0f
 
 /* Back-left tuning: remove most of the old damping so BL can keep up. */
-#define BL_HIP_AMP_SCALE    1.20f
+#define FL_HIP_AMP_SCALE    0.82f
+#define BR_HIP_AMP_SCALE    0.82f
+#define BL_HIP_AMP_SCALE    1.00f
 #define BL_KNEE_AMP_SCALE   1.22f
 #define BL_KNEE_STANCE_BOOST 4.0f
-#define BL_HIP_MIN_DEG      52.0f
-#define BL_HIP_MAX_DEG      128.0f
+#define BL_HIP_MIN_DEG      0.0f
+#define BL_HIP_MAX_DEG      180.0f
 #define BL_KNEE_MIN_DEG     18.0f
 #define BL_KNEE_MAX_DEG     118.0f
 
@@ -118,6 +124,7 @@ static void MX_I2C3_Init(void);
 static void MX_USART2_UART_Init(void);
 
 static float clampf(float v, float lo, float hi);
+static float wrap01(float x);
 static float smoothstep(float x);
 static float apply_inv(float deg, int inv);
 static float angle_to_us(float deg, float mn, float mx);
@@ -137,7 +144,7 @@ static void  Gait_Init(void);
 static void  Gait_Start(void);
 static void  Gait_Stop(void);
 static void  gait_compute_leg(float phase, float hip_n, float knee_n,
-                              float dir, float amp,
+                              float dir, float amp, float forward_bias,
                               float *hip_out, float *knee_out);
 static void  Gait_Tick(float dt_ms);
 static void  Go_To_Neutral(void);
@@ -145,6 +152,13 @@ static void  Handle_UART(void);
 
 static float clampf(float v, float lo, float hi)
 { return (v < lo) ? lo : (v > hi) ? hi : v; }
+
+static float wrap01(float x)
+{
+  while (x >= 1.0f) x -= 1.0f;
+  while (x < 0.0f)  x += 1.0f;
+  return x;
+}
 
 static float smoothstep(float x)
 { x = clampf(x, 0.0f, 1.0f); return x * x * (3.0f - 2.0f * x); }
@@ -186,11 +200,12 @@ static void enable_extension_channels(void)
 
 static void set_extensions_neutral(void)
 {
-  /* Keep FR extension at neutral. Disable FL extension output here so it does not move during neutral. */
+  /* Keep both extensions enabled and locked at neutral. */
   (void)PCA9685_SetChannelFullOff(&pca, FR_EXT_CH, 0);
-  (void)PCA9685_SetChannelFullOff(&pca, FL_EXT_CH, 1);
+  (void)PCA9685_SetChannelFullOff(&pca, FL_EXT_CH, 0);
 
   write_servo(FR_EXT_CH, apply_inv(FR_EXT_NEUTRAL + FR_EXT_TRIM, FR_EXT_INV), EXT_MIN_US, EXT_MAX_US);
+  write_servo(FL_EXT_CH, apply_inv(FL_EXT_NEUTRAL + FL_EXT_TRIM, FL_EXT_INV), EXT_MIN_US, EXT_MAX_US);
 }
 
 static void enable_hip_knee_channels(void)
@@ -271,28 +286,29 @@ static void str_to_upper(char *s)
 static void Gait_Init(void)
 {
   gait.running = 0;
-  gait.dir = +1;
+  gait.dir = -1;
   gait.yaw = 0.0f;
   gait.ramp_start_ms = 0;
   gait.t0 = 0;
 }
 
 static void gait_compute_leg(float phase, float hip_n, float knee_n,
-                             float dir, float amp,
+                             float dir, float amp, float forward_bias,
                              float *hip_out, float *knee_out)
 {
+  (void)forward_bias;
   float hip, knee;
 
+  /* Small constant symmetric swing around neutral. */
   if (phase < STANCE_END_PHASE) {
     float u = smoothstep(phase / STANCE_END_PHASE);
-    hip  = hip_n - dir * amp * (2.0f * u - 1.0f);
-    knee = knee_n + KNEE_STANCE_BEND;
+    hip  = hip_n + dir * (amp * (1.0f - 2.0f * u));
+    knee = knee_n;
   } else {
-    float u    = (phase - STANCE_END_PHASE) / (1.0f - STANCE_END_PHASE);
-    float s    = smoothstep(u);
-    float lift = (u < 0.5f) ? smoothstep(u * 2.0f) : smoothstep((1.0f - u) * 2.0f);
-    hip  = hip_n + dir * amp * (2.0f * s - 1.0f);
-    knee = knee_n + KNEE_BEND_AMP * lift;
+    float u = (phase - STANCE_END_PHASE) / (1.0f - STANCE_END_PHASE);
+    float s = smoothstep(u);
+    hip  = hip_n + dir * (amp * (-1.0f + 2.0f * s));
+    knee = knee_n;
   }
 
   *hip_out  = clampf(hip, 0.0f, 180.0f);
@@ -304,69 +320,76 @@ static void Gait_Tick(float dt_ms)
   (void)dt_ms;
   if (!gait.running) return;
 
+  set_extensions_neutral();
+
   uint32_t now = HAL_GetTick();
   if (gait.t0 == 0U) gait.t0 = now;
-
-  float phase_a = (float)((now - gait.t0) % STEP_PERIOD_MS) / (float)STEP_PERIOD_MS;
-  float phase_b = phase_a + DIAG_DELAY_PHASE;
-  if (phase_b >= 1.0f) phase_b -= 1.0f;
 
   float ramp = smoothstep(clampf((float)(now - gait.ramp_start_ms) / (float)GAIT_RAMP_MS,
                                  0.0f, 1.0f));
   float dir = (float)gait.dir;
 
-  float a_dir, b_dir, a_amp, b_amp;
-  if (dir == 0.0f) {
-    a_dir = gait.yaw;
-    b_dir = -gait.yaw;
-    a_amp = HIP_SWING_AMP;
-    b_amp = HIP_SWING_AMP;
+  float left_amp  = HIP_SWING_AMP * clampf(1.0f - gait.yaw, 0.0f, 2.0f);
+  float right_amp = HIP_SWING_AMP * clampf(1.0f + gait.yaw, 0.0f, 2.0f);
+
+  float fl_hip  = FL_HIP_NEUTRAL + FL_HIP_TRIM;
+  float br_hip  = BR_HIP_NEUTRAL + BR_HIP_TRIM;
+  float fr_hip  = FR_HIP_NEUTRAL + FR_HIP_TRIM;
+  float bl_hip  = BL_HIP_NEUTRAL + BL_HIP_TRIM;
+  float fr_knee = FR_KNEE_NEUTRAL + FR_KNEE_TRIM;
+  float fl_knee = FL_KNEE_NEUTRAL + FL_KNEE_TRIM;
+  float br_knee = BR_KNEE_NEUTRAL + BR_KNEE_TRIM;
+  float bl_knee = BL_KNEE_NEUTRAL + BL_KNEE_TRIM;
+
+  float cycle_phase = (float)((now - gait.t0) % STEP_PERIOD_MS) / (float)STEP_PERIOD_MS;
+  float pair_phase;
+  float hip, knee;
+
+  if (cycle_phase < 0.5f) {
+    pair_phase = cycle_phase * 2.0f;
+
+    /* Pair A moves first: BL + FR. Pair B holds neutral. */
+    gait_compute_leg(pair_phase,
+                     BL_HIP_NEUTRAL + BL_HIP_TRIM, BL_KNEE_NEUTRAL + BL_KNEE_TRIM,
+                     dir, left_amp, HIP_FORWARD_BIAS, &hip, &knee);
+    bl_hip = hip;
+
+    gait_compute_leg(pair_phase,
+                     FR_HIP_NEUTRAL + FR_HIP_TRIM, FR_KNEE_NEUTRAL + FR_KNEE_TRIM,
+                     dir, right_amp, HIP_FORWARD_BIAS, &hip, &knee);
+    fr_hip = hip;
   } else {
-    a_amp = HIP_SWING_AMP * clampf(1.0f + gait.yaw, 0.0f, 2.0f);
-    b_amp = HIP_SWING_AMP * clampf(1.0f - gait.yaw, 0.0f, 2.0f);
-    a_dir = dir;
-    b_dir = dir;
+    pair_phase = (cycle_phase - 0.5f) * 2.0f;
+
+    /* Pair B moves after Pair A finishes: BR + FL. Pair A holds neutral. */
+    gait_compute_leg(pair_phase,
+                     BR_HIP_NEUTRAL + BR_HIP_TRIM, BR_KNEE_NEUTRAL + BR_KNEE_TRIM,
+                     -dir, right_amp, HIP_FORWARD_BIAS, &hip, &knee);
+    br_hip = hip;
+
+    gait_compute_leg(pair_phase,
+                     FL_HIP_NEUTRAL + FL_HIP_TRIM, FL_KNEE_NEUTRAL + FL_KNEE_TRIM,
+                     -dir, left_amp, HIP_FORWARD_BIAS, &hip, &knee);
+    fl_hip = hip;
   }
 
-  float fr_hip, fr_knee, bl_hip, bl_knee;
-  float fl_hip, fl_knee, br_hip, br_knee;
-
-  /* True diagonal sync: FR+BL share phase_a, FL+BR share phase_b. */
-  gait_compute_leg(phase_a, FR_HIP_NEUTRAL + FR_HIP_TRIM, FR_KNEE_NEUTRAL + FR_KNEE_TRIM,
-                   a_dir, a_amp, &fr_hip, &fr_knee);
-  gait_compute_leg(phase_a, BL_HIP_NEUTRAL + BL_HIP_TRIM, BL_KNEE_NEUTRAL + BL_KNEE_TRIM,
-                   a_dir, a_amp * BL_HIP_AMP_SCALE, &bl_hip, &bl_knee);
-  gait_compute_leg(phase_b, FL_HIP_NEUTRAL + FL_HIP_TRIM, FL_KNEE_NEUTRAL + FL_KNEE_TRIM,
-                   b_dir, b_amp, &fl_hip, &fl_knee);
-  gait_compute_leg(phase_b, BR_HIP_NEUTRAL + BR_HIP_TRIM, BR_KNEE_NEUTRAL + BR_KNEE_TRIM,
-                   b_dir, b_amp, &br_hip, &br_knee);
-
-  /* Knee motion disabled: keep the current knee neutral positions during gait. */
-
 #define RAMP_VAL(val, n) ((n) + ramp * ((val) - (n)))
-  fr_hip  = RAMP_VAL(fr_hip,  FR_HIP_NEUTRAL + FR_HIP_TRIM);
-  bl_hip  = RAMP_VAL(bl_hip,  BL_HIP_NEUTRAL + BL_HIP_TRIM);
   fl_hip  = RAMP_VAL(fl_hip,  FL_HIP_NEUTRAL + FL_HIP_TRIM);
   br_hip  = RAMP_VAL(br_hip,  BR_HIP_NEUTRAL + BR_HIP_TRIM);
+  fr_hip  = RAMP_VAL(fr_hip,  FR_HIP_NEUTRAL + FR_HIP_TRIM);
+  bl_hip  = RAMP_VAL(bl_hip,  BL_HIP_NEUTRAL + BL_HIP_TRIM);
 #undef RAMP_VAL
 
-  fr_knee = FR_KNEE_NEUTRAL + FR_KNEE_TRIM;
-  fl_knee = FL_KNEE_NEUTRAL + FL_KNEE_TRIM;
-  br_knee = BR_KNEE_NEUTRAL + BR_KNEE_TRIM;
-  bl_knee = BL_KNEE_NEUTRAL + BL_KNEE_TRIM;
-
-  /* Still keep BL hip inside a safe window. */
   bl_hip  = clampf(bl_hip,  BL_HIP_MIN_DEG,  BL_HIP_MAX_DEG);
 
-  /* Write the BL pair first so it gets updated earliest each control cycle. */
-  write_servo(BL_HIP_CH,  apply_inv(bl_hip, BL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(BL_KNEE_CH, apply_inv(bl_knee, BL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(FR_HIP_CH,  apply_inv(fr_hip, FR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(FR_KNEE_CH, apply_inv(fr_knee, FR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
-  write_servo(BR_HIP_CH,  apply_inv(br_hip, BR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
-  write_servo(BR_KNEE_CH, apply_inv(br_knee, BR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
   write_servo(FL_HIP_CH,  apply_inv(fl_hip, FL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
   write_servo(FL_KNEE_CH, apply_inv(fl_knee, FL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BR_HIP_CH,  apply_inv(br_hip, BR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BR_KNEE_CH, apply_inv(br_knee, BR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(FR_HIP_CH,  apply_inv(fr_hip, FR_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(FR_KNEE_CH, apply_inv(fr_knee, FR_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
+  write_servo(BL_HIP_CH,  apply_inv(bl_hip, BL_HIP_INV), HIP_MIN_US,  HIP_MAX_US);
+  write_servo(BL_KNEE_CH, apply_inv(bl_knee, BL_KNEE_INV), KNEE_MIN_US, KNEE_MAX_US);
 }
 
 static void Go_To_Neutral(void)
@@ -392,7 +415,7 @@ static void Gait_Start(void)
 static void Gait_Stop(void)
 {
   gait.running = 0;
-  gait.dir = +1;
+  gait.dir = -1;
   gait.yaw = 0.0f;
   gait.ramp_start_ms = 0;
   gait.t0 = 0;
@@ -406,23 +429,23 @@ static void Handle_UART(void)
   str_to_upper(rx);
 
   if (strcmp(rx, TOKEN_GO) == 0 || strcmp(rx, TOKEN_FWD) == 0) {
-    gait.dir = +1;
+    gait.dir = -1;
     gait.yaw = 0.0f;
     if (!gait.running) Gait_Start();
     UART_Sendf("FWD\r\n");
   } else if (strcmp(rx, TOKEN_BACK) == 0) {
-    gait.dir = -1;
+    gait.dir = +1;
     gait.yaw = 0.0f;
     if (!gait.running) Gait_Start();
     UART_Sendf("BACK\r\n");
   } else if (strcmp(rx, TOKEN_LEFT) == 0) {
     gait.yaw = -1.0f;
-    if (gait.dir == 0) gait.dir = +1;
+    if (gait.dir == 0) gait.dir = -1;
     if (!gait.running) Gait_Start();
     UART_Sendf("LEFT\r\n");
   } else if (strcmp(rx, TOKEN_RIGHT) == 0) {
     gait.yaw = +1.0f;
-    if (gait.dir == 0) gait.dir = +1;
+    if (gait.dir == 0) gait.dir = -1;
     if (!gait.running) Gait_Start();
     UART_Sendf("RIGHT\r\n");
   } else if (strcmp(rx, "PIVOT_LEFT") == 0) {
@@ -468,15 +491,14 @@ int main(void)
   set_extensions_neutral();
   UART_Sendf("PCA9685 OK\r\n");
   UART_Sendf("Jitter fix applied: channels are enabled once, not re-toggled every control cycle.\r\n");
-  UART_Sendf("BL hip strengthened: more swing and wider allowed range.\r\n");
+  UART_Sendf("BL hip clamp removed so the back-left hip can move freely during gait.\r\n");
 
   Gait_Init();
   Go_To_Neutral();
 
   UART_Sendf("At neutral. Holding %lu ms before walking...\r\n", (unsigned long)START_HOLD_MS);
-  UART_Sendf("FR extension locked at neutral. FL extension output disabled during neutral to stop unwanted motion.\r\n");
-  UART_Sendf("Diagonal delay removed: both diagonal groups move together now.\r\n");
-  UART_Sendf("Right knees are mirrored from the left knees (FR mirrors FL, BR mirrors BL).\r\n");
+  UART_Sendf("Both extensions locked at neutral during neutral and walking.\r\n");
+  UART_Sendf("No wait between legs: gait runs FL -> FR -> BL -> BR continuously. FL and BR hip swing reduced; leg move time slowed slightly.\r\n");
   {
     uint32_t t = HAL_GetTick();
     while ((uint32_t)(HAL_GetTick() - t) < START_HOLD_MS) {
