@@ -29,21 +29,21 @@
 #define EXT_MAX_US   2200.0f
 
 #define FR_HIP_NEUTRAL  60.0f //100
-#define FR_KNEE_NEUTRAL   0.0f
+#define FR_KNEE_NEUTRAL   FL_KNEE_NEUTRAL // mirror front-left knee to front-right
 #define FR_EXT_NEUTRAL    0.0f
 #define FL_HIP_NEUTRAL  130.0f //100
-#define FL_KNEE_NEUTRAL   0.0f
+#define FL_KNEE_NEUTRAL  110.0f //0
 #define FL_EXT_NEUTRAL    0.0f
 #define BR_HIP_NEUTRAL   130.0f //90
-#define BR_KNEE_NEUTRAL  90.0f
+#define BR_KNEE_NEUTRAL  BL_KNEE_NEUTRAL // mirror back-left knee to back-right
 #define BL_HIP_NEUTRAL   60.0f //90
-#define BL_KNEE_NEUTRAL  40.0f
+#define BL_KNEE_NEUTRAL  100.0f //40
 
 #define FR_HIP_TRIM   0.0f
 #define FR_KNEE_TRIM  0.0f
 #define FR_EXT_TRIM   0.0f
 #define FR_HIP_INV    0
-#define FR_KNEE_INV   0
+#define FR_KNEE_INV   1
 #define FR_EXT_INV    0
 
 #define FL_HIP_TRIM   0.0f
@@ -56,7 +56,7 @@
 #define BR_HIP_TRIM   0.0f
 #define BR_KNEE_TRIM  0.0f
 #define BR_HIP_INV    1
-#define BR_KNEE_INV   0
+#define BR_KNEE_INV   1
 
 #define BL_HIP_TRIM   0.0f
 #define BL_KNEE_TRIM  0.0f
@@ -67,7 +67,7 @@
 #define STEP_PERIOD_MS     1700U
 #define START_HOLD_MS      5000U
 #define GAIT_RAMP_MS       2200U
-#define DIAG_DELAY_PHASE   0.50f
+#define DIAG_DELAY_PHASE   0.0f
 #define STANCE_END_PHASE   0.62f
 #define HIP_SWING_AMP      22.0f
 #define KNEE_BEND_AMP      48.0f
@@ -186,10 +186,11 @@ static void enable_extension_channels(void)
 
 static void set_extensions_neutral(void)
 {
-  /* Front extension calibration: FR holds near 5 deg, FL needs 90 deg on this robot. */
-  enable_extension_channels();
+  /* Keep FR extension at neutral. Disable FL extension output here so it does not move during neutral. */
+  (void)PCA9685_SetChannelFullOff(&pca, FR_EXT_CH, 0);
+  (void)PCA9685_SetChannelFullOff(&pca, FL_EXT_CH, 1);
+
   write_servo(FR_EXT_CH, apply_inv(FR_EXT_NEUTRAL + FR_EXT_TRIM, FR_EXT_INV), EXT_MIN_US, EXT_MAX_US);
-  write_servo(FL_EXT_CH, apply_inv(FL_EXT_NEUTRAL + FL_EXT_TRIM, FL_EXT_INV), EXT_MIN_US, EXT_MAX_US);
 }
 
 static void enable_hip_knee_channels(void)
@@ -473,8 +474,9 @@ int main(void)
   Go_To_Neutral();
 
   UART_Sendf("At neutral. Holding %lu ms before walking...\r\n", (unsigned long)START_HOLD_MS);
-  UART_Sendf("Extensions locked at 0 deg during walk.\r\n");
-  UART_Sendf("Diagonal alternation active: FL+BR and FR+BL are 180 deg out of phase.\r\n");
+  UART_Sendf("FR extension locked at neutral. FL extension output disabled during neutral to stop unwanted motion.\r\n");
+  UART_Sendf("Diagonal delay removed: both diagonal groups move together now.\r\n");
+  UART_Sendf("Right knees are mirrored from the left knees (FR mirrors FL, BR mirrors BL).\r\n");
   {
     uint32_t t = HAL_GetTick();
     while ((uint32_t)(HAL_GetTick() - t) < START_HOLD_MS) {
